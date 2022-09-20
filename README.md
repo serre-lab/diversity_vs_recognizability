@@ -1,1 +1,1 @@
-# diversity_vs_recognizability
+# Diversity vs. Recognizability: Human-like generalization in one-shot generative models
