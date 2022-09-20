@@ -14,8 +14,14 @@ python train
 ```
 
 ### DAGAN (Data Augmentation GAN [])
+To train the version using the ResNet Architecture (i.e. DA-GAN-RN)
 ```
-python train
+python 1_train_DAGAN.py --img_size 50 --epochs 30 --c_iter 5 --z_size 128 --out_dir DAGAN --seed 0 --architecture ResNet 
+```
+
+To train the version using the UNet Architecture (i.e. DA-GAN-UN)
+```
+python 1_train_DAGAN.py --img_size 50 --epochs 30 --c_iter 5 --z_size 128 --out_dir DAGAN --seed 0 --architecture UResNet 
 ```
 
 ## 2. Train the critic networks
