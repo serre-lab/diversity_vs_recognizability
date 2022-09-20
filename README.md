@@ -1,5 +1,5 @@
 # Diversity vs. Recognizability: Human-like generalization in one-shot generative models
-
+![plot](image/Fig1a.png)
 ## 1. Train the one-shot generative models
 
 ### VAE-STN (VAE with spatial transformer [])
