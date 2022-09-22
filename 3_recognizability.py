@@ -6,31 +6,28 @@ from utils.monitoring import str2bool, plot_img
 from few_shot.proto import compute_prototypes
 
 from torch.utils.data import DataLoader
-from model.network import SeqVaeCondGeneral2b
+#from model.network import SeqVaeCondGeneral2b
 import matplotlib.pyplot as plt
 import torch.nn.functional as f
 import torchvision
 
-from few_shot.models import get_few_shot_encoder
-from few_shot.utils_few_shot import pairwise_distances
-import matplotlib.image as mpimg
+#from few_shot.models import get_few_shot_encoder
+
+#from few_shot.utils_few_shot import pairwise_distances
+
 import numpy as np
 from utils.custom_loader import OmniglotDataset
 import math
-from evaluation_utils.decision_boundary import classifier_prediction, generate_evaluation_task
-from evaluation_utils.generative_models import load_generative_model
-#from evaluation_utils.decision_boundary import generator_prediction
-from matplotlib.offsetbox import TextArea, DrawingArea, OffsetImage, AnnotationBbox
-import matplotlib.image as mpimg
+#from evaluation_utils.decision_boundary import classifier_prediction, generate_evaluation_task
+from utils.evaluation_tools import load_generative_model
 
-import cv2
 import os
-import scipy.stats as stats
+
 from utils.custom_transform import Binarize, Invert, Scale_0_1, Dilate, ScaleCenter
 import torchvision.transforms as tforms
-from few_shot.core import NShotTaskSampler
+from utils.custom_loader import NShotTaskSampler
 from utils.custom_transform import Binarize_batch, Scale_0_1_batch
-from exp_list_accu import *
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='omniglot', choices=['omniglot_weak', 'human_drawing', 'omniglot'],
