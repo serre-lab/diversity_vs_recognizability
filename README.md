@@ -1,9 +1,16 @@
 # Diversity vs. Recognizability: Human-like generalization in one-shot generative models
-<img src="image/Fig1.png" width="400"><img src="image/Fig1.png" width="400">
+
+https://arxiv.org/abs/2205.10370
+
+## 1. Quick Summary
+
+<img src="image/Fig1.png" height="400"><img src="image/Fig3.png" height="400">
+
+
+
+## 2. Train the one-shot generative models
 
 Before training any generative model, you need to download the [Omniglot dataset](https://github.com/brendenlake/omniglot) [1] (the images_background.zip and images_evaluation files for python). Then unzip those files and rename the folders 'background' and 'evaluation', respectively. In the command line below, you need to specify the dataset path in `--dataset_root`.
-
-## 1. Train the one-shot generative models
 
 ### VAE-STN (VAE with spatial transformer [2])
 ```
@@ -32,22 +39,33 @@ python3 1_train_DAGAN.py --epochs 30 --device cuda:0 --c_iter 5 --z_size 128 --o
 
 Do not forget to change `--out_dir` and `--dataset_root` args to your saving path and data path (omniglot). If you want to reproduce all the DA-GAN models presented in Fig. 3a, you need to run these command lines and vary `--z_size` from 10 to 1000 (by step of 10).
 
-## 2. Train the critic networks
-### SimCLR
-```
-python train
-```
+Here are some samples from the one-shot generative model trained using the command line above : 
+<img src="image/Fig3b.png" height="400">
 
-### Protoypical Net
+## 3. Train the critic networks
+### SimCLR [5]
+The SimCLR feature extractor is mainly used to compute the diversity metric. To train it run the following command
 ```
-python train
+python3 2_train_simclr.py --device cuda:3 --z_size 256 --batch_size 64 --strength normal --out_dir out_dir --dataset_root dataset_root
 ```
+Do not forget to change `--out_dir` and `--dataset_root` args to your saving path and data path (omniglot)
 
-## 3. Evaluate the one-shot generative models on the Diversity vs. Recognizability framework.
+### Protoypical Net [6]
+The Protototypical Network is used to assess the recognizability metric. To train it, run the following command
+```
+python3 2_train_protonet.py --device cuda:0 --q-train 5 --k-test 20 --model_name proto_net --preload --z_size 256 --out_dir out_dir --dataset_root dataset_root
+```
+Do not forget to change `--out_dir` and `--dataset_root` args to your saving path and data path (omniglot)
+
+
+## 4. Evaluate the one-shot generative models on the Diversity vs. Recognizability framework.
 
 ### Reference
-[]
-[]
-[]
+[1] - Lake, Brenden M., Ruslan Salakhutdinov, and Joshua B. Tenenbaum. "Human-level concept learning through probabilistic program induction." Science 350.6266 (2015): 1332-1338.\
+[2] - Rezende, Danilo, et al. "One-shot generalization in deep generative models." International conference on machine learning. PMLR, 2016.\
+[3] - Edwards, Harrison, and Amos Storkey. "Towards a neural statistician." arXiv preprint arXiv:1606.02185 (2016).\
+[4] - Antoniou, Antreas, Amos Storkey, and Harrison Edwards. "Data augmentation generative adversarial networks." arXiv preprint arXiv:1711.04340 (2017).\
+[5] - Chen, Ting, et al. "A simple framework for contrastive learning of visual representations." International conference on machine learning. PMLR, 2020.\
+[6] - Snell, Jake, Kevin Swersky, and Richard Zemel. "Prototypical networks for few-shot learning." Advances in neural information processing systems 30 (2017).
 
 
