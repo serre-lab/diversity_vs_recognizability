@@ -1,0 +1,675 @@
+/mnt/md0/home/vboutin/prj_zero_gene/train_simclr.py
+import argparse
+import torch
+from utils.monitoring import make_directories, compute_parameter_grad, get_logger, \
+    plot_gif, visualize, plot_img, str2bool, visual_evaluation
+from utils.data_loader import load_dataset_exemplar
+from evaluation_utils.generative_models import load_generative_model
+
+from torch import optim
+import torch.nn as nn
+import numpy as np
+import random
+
+import os
+#import random
+#import matplotlib.pyplot as plt
+
+#from torch import optim
+
+#from simclr.data_utils import ResizedRotation, WrapWithRandomParams, PretrainingDatasetWrapper
+#import torchvision.transforms.functional as tfv
+from simclr.model_simclr import ImageEmbedding
+from torch.optim import RMSprop
+from simclr.loss import ContrastiveLoss
+from utils.custom_loader import Contrastive_augmentation
+from utils.loading_tools import load_weights, load_net
+import torchvision.transforms as tf
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from utils.custom_transform import Binarize_batch, Scale_0_1_batch
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--z_size', type=int, default=128)
+parser.add_argument('--dataset', type=str, default='omniglot', choices=['omniglot', 'omniglot_weak', 'mnist', 'human_drawing',
+                                                                             'human_drawing_and_omniglot', 'quick_draw',
+                                                                             'human_drawing_and_quick_draw'],
+                    metavar='DATASET', help='Dataset choice.')
+parser.add_argument('--download_data', type=eval, default=False, choices=[True, False])
+parser.add_argument('--dataset_root', type=str, default="/media/data_cifs_lrs/projects/prj_control/data")
+parser.add_argument('--input_type', type=str, default='binary',
+                    choices=['binary'], help='type of the input')
+parser.add_argument('--batch_size', type=int, default=128, metavar='BATCH_SIZE',
+                    help='input batch size for training')
+parser.add_argument('--learning_rate', type=float, default=1e-3, metavar='LR',
+                    help='learning rate of the optimizer')
+parser.add_argument('--seed', type=int, default=None, metavar='SEED', help='random seed (None is no seed)')
+parser.add_argument('--epoch', type=int, default=100, metavar='EPOCH', help='number of epoch')
+
+parser.add_argument("--input_shape", nargs='+', type=int, default=[1, 50, 50],
+                    help='shape of the input [channel, height, width]')
+parser.add_argument('-od', '--out_dir', type=str, default='/media/data_cifs/projects/prj_zero_gene/exp/',
+                    metavar='OUT_DIR', help='output directory for model snapshots etc.')
+parser.add_argument('--debug', default=False, action='store_true', help='debugging flag (do not save the network)')
+#parser.add_argument('--beta_adam', type=float, default=0.9, help='value of the first order beta in adam optimizer')
+
+parser.add_argument('--device', type=str, default='cuda:0', help='cuda device')
+parser.add_argument('--tag', type=str, default='', help='tag of the experiment')
+#parser.add_argument("--exemplar", type=str2bool, nargs='?', const=True, default=True, help="For conditional VAE")
+parser.add_argument('--model_name', type=str, default='simclr', choices=['simclr'],
+                    help="type of the model")
+parser.add_argument('--auto_param', default=False, action='store_true', help='set all the param automatically')
+
+parser.add_argument('--preload', default=False, action='store_true', help='preload the dataset')
+#parser.add_argument("--shuffle_exemplar", type=str2bool, nargs='?', const=True, default=False, help="shuffle the exemplar")
+parser.add_argument("--generative_model", nargs='+', type=str, default=[''],
+                    help='list of the generative algorithms we want to use for training')
+#parser.add_argument('--generative_model', type=str, default=None,
+#                    metavar='gen_model', help='name of the generative model to load')
+parser.add_argument("--augment", type=str2bool, nargs='?', const=True, default=False, help="data augmentation")
+parser.add_argument("--rate_scheduler", type=str2bool, nargs='?', const=True, default=False, help="include a rate scheduler")
+parser.add_argument("--exemplar_type", default='prototype', choices=['prototype', 'first', 'shuffle'],
+                    metavar='EX_TYPE', help='type of exemplar')
+
+args = parser.parse_args()
+
+args.generative_model = tuple(args.generative_model)
+args.input_shape = tuple(args.input_shape)
+#args.generative_model = ('vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta0.8_rc_vae_stn13')
+#                         'vae_stn_stn_2022-02-20_11_44_05_exVAE_z40_T80_rs10_rs10_beta1.0_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta1.4_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta2.0_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta2.5_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta3.0_rc_vae_stn13')
+
+
+#args.generative_model = ('vae_stn_stn_2022-02-20_11_44_05_exVAE_z40_T80_rs10_rs10_beta1.0_rc_vae_stn13',)
+
+if args.device == 'meso':
+    args.device = torch.cuda.current_device()
+
+if args.generative_model != ('',):
+    print(args.generative_model)
+    batch_size_loss = (len(args.generative_model) + 1) * args.batch_size
+    all_generation_function = []
+    scale_01, binarize = Scale_0_1_batch(), Binarize_batch(binary_threshold=0.5)
+    with torch.no_grad():
+        for generative_models in args.generative_model:
+            one_generative_function = load_generative_model(model='vae_stn', model_name = generative_models, device=args.device)
+            all_generation_function.append(one_generative_function)
+else:
+    batch_size_loss = args.batch_size
+    print('no generative models')
+
+
+default_args = parser.parse_args([])
+if args.auto_param:
+    args = retrieve_param(args, default_args)
+
+if args.seed is not None:
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+
+if args.debug:
+    visual_steps, monitor_steps = 1, 25 # 50
+else:
+    visual_steps, monitor_steps = 10, 50
+
+args = make_directories(args)
+kwargs = {'preload': args.preload}
+
+train_loader, test_loader, args = \
+    load_dataset_exemplar(args, shape = args.input_shape, shuffle=True, drop_last=True)
+
+model_embedding = ImageEmbedding(args.z_size).to(args.device)
+
+SimCLR_loss = ContrastiveLoss(batch_size_loss).to(args.device)
+optimizer = RMSprop(model_embedding.parameters(), lr=args.learning_rate)
+
+scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
+
+if not args.debug:
+    logger = get_logger(args, __file__)
+    writer = SummaryWriter(args.snap_dir)
+else:
+    logger = None
+    writer = None
+
+augment = Contrastive_augmentation(train_loader.dataset, target_size=args.input_shape[1:])
+
+best_loss = np.inf
+
+for epoch in range(args.epoch):
+    train_loss = 0
+    len_dataset = 0
+    model_embedding.train()
+    for batch_idx, (data, exemplar, label) in enumerate(train_loader):
+        exemplar = exemplar.to(args.device)
+        data = data.to(args.device)
+        if args.generative_model != ('',):
+            #    random_split = torch.randperm(data.size(0))
+            #    nb_split = data.size(0) // (len(args.generative_model) + 1)
+            all_samples = []
+            for idx_model, generative_models in enumerate(args.generative_model):
+                samples = all_generation_function[idx_model](data, exemplar)
+
+                all_samples.append(samples)
+            all_samples.append(data)
+            all_samples = torch.cat(all_samples, dim=0)
+            all_samples = binarize(scale_01(all_samples))
+        else:
+            all_samples = data
+
+        X, Y = augment(all_samples)
+
+        X, Y = X.to(args.device), Y.to(args.device)
+        embX, projX = model_embedding(X)
+        embY, projY = model_embedding(Y)
+        loss = SimCLR_loss(projX, projY)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        len_dataset += X.size(0)
+
+        train_loss += loss.item()
+
+        if batch_idx % monitor_steps == 0:
+            to_print = 'Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.3f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader),
+                       loss.item()
+                       )
+            if args.debug:
+                print(to_print)
+            else:
+                logger.info(to_print)
+
+    train_loss /= len(train_loader)
+
+    to_print = '====> Epoch: {} Avg loss: {:.4f}'.format(
+        epoch, train_loss)
+
+    if args.debug:
+        print(to_print)
+    else:
+        logger.info(to_print)
+
+    if writer is not None:
+        writer.add_scalar("Loss/train", train_loss, epoch)
+
+
+    model_embedding.eval()
+    eval_loss = 0
+    for batch_idx, (data, exemplar, label) in enumerate(test_loader):
+
+        exemplar = exemplar.to(args.device)
+        data = data.to(args.device)
+        if args.generative_model != ('',):
+            #    random_split = torch.randperm(data.size(0))
+            #    nb_split = data.size(0) // (len(args.generative_model) + 1)
+            all_samples = []
+            for idx_model, generative_models in enumerate(args.generative_model):
+                samples = all_generation_function[idx_model](data, exemplar)
+
+                all_samples.append(samples)
+            all_samples.append(data)
+            all_samples = torch.cat(all_samples, dim=0)
+            all_samples = binarize(scale_01(all_samples))
+        else:
+            all_samples = data
+
+        X, Y = augment(all_samples)
+
+        #if args.generative_model is not None :
+        #    data = data.to(args.device)
+        #    exemplar = exemplar.to(args.device)
+        #    samples, _, _ = gen_model.generate(exemplar.size(0), exemplar=exemplar, low_memory=True)
+        #    X, Y = augment(samples)
+        #else:
+        #    X, Y = augment(data)
+        X, Y = X.to(args.device), Y.to(args.device)
+        embX, projX = model_embedding(X)
+        embY, projY = model_embedding(Y)
+        loss = SimCLR_loss(projX, projY)
+
+
+
+        len_dataset += X.size(0)
+
+        eval_loss += loss.item()
+
+    eval_loss /= len(test_loader)
+
+    if args.rate_scheduler:
+        scheduler.step(eval_loss)
+
+    to_print = '====> TEST Epoch: {} Avg loss: {:.4f}'.format(
+        epoch, eval_loss)
+
+    if not args.debug:
+        torch.save(model_embedding.state_dict(), args.snap_dir + '_end.model')
+
+    if args.debug:
+        print(to_print)
+    else:
+        logger.info(to_print)
+
+    if writer is not None:
+        writer.add_scalar("Loss/eval", eval_loss, epoch)
+        writer.add_scalar("rate", optimizer.param_groups[0]['lr'], epoch)
+
+
+    if eval_loss < best_loss:
+        if not args.debug:
+            torch.save(model_embedding.state_dict(), args.snap_dir + '_best.model')
+        best_loss = eval_loss
+
+
+
+
+
+
+Namespace(augment=False, auto_param=False, batch_size=448, dataset='omniglot', dataset_root='/media/data_cifs_lrs/projects/prj_control/data', debug=False, device='cuda:7', download_data=False, epoch=100, exemplar_type='prototype', fig_dir='/media/data_cifs/projects/prj_zero_gene/exp/omniglot/simclr/simclr_2022-02-22_14_21_52_z256_Omniglot_only/fig/', generative_model=('',), input_shape=(1, 50, 50), input_type='binary', learning_rate=0.001, model_name='simclr', model_signature='simclr_2022-02-22_14_21_52_z256_Omniglot_only', out_dir='/media/data_cifs/projects/prj_zero_gene/exp/', preload=True, rate_scheduler=False, seed=None, snap_dir='/media/data_cifs/projects/prj_zero_gene/exp/omniglot/simclr/simclr_2022-02-22_14_21_52_z256_Omniglot_only/', tag='Omniglot_only', z_size=256)
+PID 12226
+Train Epoch: 0 [0/29460 (0%)]	Loss: 6.616
+Train Epoch: 0 [22400/29460 (77%)]	Loss: 5.509
+====> Epoch: 0 Avg loss: 5.7120
+====> TEST Epoch: 0 Avg loss: 5.6312
+Train Epoch: 1 [0/29460 (0%)]	Loss: 5.490
+Train Epoch: 1 [22400/29460 (77%)]	Loss: 5.428
+====> Epoch: 1 Avg loss: 5.4657
+====> TEST Epoch: 1 Avg loss: 5.4346
+Train Epoch: 2 [0/29460 (0%)]	Loss: 5.414
+Train Epoch: 2 [22400/29460 (77%)]	Loss: 5.331
+====> Epoch: 2 Avg loss: 5.3712
+====> TEST Epoch: 2 Avg loss: 5.5317
+Train Epoch: 3 [0/29460 (0%)]	Loss: 5.337
+Train Epoch: 3 [22400/29460 (77%)]	Loss: 5.306
+====> Epoch: 3 Avg loss: 5.2993
+====> TEST Epoch: 3 Avg loss: 5.3738
+Train Epoch: 4 [0/29460 (0%)]	Loss: 5.264
+Train Epoch: 4 [22400/29460 (77%)]	Loss: 5.270
+====> Epoch: 4 Avg loss: 5.2636
+====> TEST Epoch: 4 Avg loss: 5.2925
+Train Epoch: 5 [0/29460 (0%)]	Loss: 5.241
+Train Epoch: 5 [22400/29460 (77%)]	Loss: 5.262
+====> Epoch: 5 Avg loss: 5.2336
+====> TEST Epoch: 5 Avg loss: 5.3503
+Train Epoch: 6 [0/29460 (0%)]	Loss: 5.229
+Train Epoch: 6 [22400/29460 (77%)]	Loss: 5.201
+====> Epoch: 6 Avg loss: 5.2117
+====> TEST Epoch: 6 Avg loss: 5.3400
+Train Epoch: 7 [0/29460 (0%)]	Loss: 5.216
+Train Epoch: 7 [22400/29460 (77%)]	Loss: 5.192
+====> Epoch: 7 Avg loss: 5.2012
+====> TEST Epoch: 7 Avg loss: 5.2632
+Train Epoch: 8 [0/29460 (0%)]	Loss: 5.199
+Train Epoch: 8 [22400/29460 (77%)]	Loss: 5.163
+====> Epoch: 8 Avg loss: 5.1853
+====> TEST Epoch: 8 Avg loss: 5.2414
+Train Epoch: 9 [0/29460 (0%)]	Loss: 5.184
+Train Epoch: 9 [22400/29460 (77%)]	Loss: 5.171
+====> Epoch: 9 Avg loss: 5.1788
+====> TEST Epoch: 9 Avg loss: 5.2281
+Train Epoch: 10 [0/29460 (0%)]	Loss: 5.151
+Train Epoch: 10 [22400/29460 (77%)]	Loss: 5.191
+====> Epoch: 10 Avg loss: 5.1670
+====> TEST Epoch: 10 Avg loss: 5.2678
+Train Epoch: 11 [0/29460 (0%)]	Loss: 5.174
+Train Epoch: 11 [22400/29460 (77%)]	Loss: 5.151
+====> Epoch: 11 Avg loss: 5.1598
+====> TEST Epoch: 11 Avg loss: 5.1975
+Train Epoch: 12 [0/29460 (0%)]	Loss: 5.146
+Train Epoch: 12 [22400/29460 (77%)]	Loss: 5.145
+====> Epoch: 12 Avg loss: 5.1483
+====> TEST Epoch: 12 Avg loss: 5.1859
+Train Epoch: 13 [0/29460 (0%)]	Loss: 5.145
+Train Epoch: 13 [22400/29460 (77%)]	Loss: 5.122
+====> Epoch: 13 Avg loss: 5.1410
+====> TEST Epoch: 13 Avg loss: 5.1862
+Train Epoch: 14 [0/29460 (0%)]	Loss: 5.125
+Train Epoch: 14 [22400/29460 (77%)]	Loss: 5.123
+====> Epoch: 14 Avg loss: 5.1342
+====> TEST Epoch: 14 Avg loss: 5.1697
+Train Epoch: 15 [0/29460 (0%)]	Loss: 5.122
+Train Epoch: 15 [22400/29460 (77%)]	Loss: 5.129
+====> Epoch: 15 Avg loss: 5.1280
+====> TEST Epoch: 15 Avg loss: 5.3617
+Train Epoch: 16 [0/29460 (0%)]	Loss: 5.149
+Train Epoch: 16 [22400/29460 (77%)]	Loss: 5.127
+====> Epoch: 16 Avg loss: 5.1208
+====> TEST Epoch: 16 Avg loss: 5.1620
+Train Epoch: 17 [0/29460 (0%)]	Loss: 5.108
+Train Epoch: 17 [22400/29460 (77%)]	Loss: 5.120
+====> Epoch: 17 Avg loss: 5.1169
+====> TEST Epoch: 17 Avg loss: 5.1718
+Train Epoch: 18 [0/29460 (0%)]	Loss: 5.117
+Train Epoch: 18 [22400/29460 (77%)]	Loss: 5.111
+====> Epoch: 18 Avg loss: 5.1119
+====> TEST Epoch: 18 Avg loss: 5.1599
+Train Epoch: 19 [0/29460 (0%)]	Loss: 5.096
+Train Epoch: 19 [22400/29460 (77%)]	Loss: 5.114
+====> Epoch: 19 Avg loss: 5.1065
+====> TEST Epoch: 19 Avg loss: 5.2192
+Train Epoch: 20 [0/29460 (0%)]	Loss: 5.110
+Train Epoch: 20 [22400/29460 (77%)]	Loss: 5.099
+====> Epoch: 20 Avg loss: 5.1035
+====> TEST Epoch: 20 Avg loss: 5.2013
+Train Epoch: 21 [0/29460 (0%)]	Loss: 5.083
+Train Epoch: 21 [22400/29460 (77%)]	Loss: 5.107
+====> Epoch: 21 Avg loss: 5.0982
+====> TEST Epoch: 21 Avg loss: 5.1305
+Train Epoch: 22 [0/29460 (0%)]	Loss: 5.074
+Train Epoch: 22 [22400/29460 (77%)]	Loss: 5.085
+====> Epoch: 22 Avg loss: 5.0940
+====> TEST Epoch: 22 Avg loss: 5.1994
+Train Epoch: 23 [0/29460 (0%)]	Loss: 5.112
+Train Epoch: 23 [22400/29460 (77%)]	Loss: 5.087
+====> Epoch: 23 Avg loss: 5.0937
+====> TEST Epoch: 23 Avg loss: 5.2026
+Train Epoch: 24 [0/29460 (0%)]	Loss: 5.114
+Train Epoch: 24 [22400/29460 (77%)]	Loss: 5.082
+====> Epoch: 24 Avg loss: 5.0885
+====> TEST Epoch: 24 Avg loss: 5.1468
+Train Epoch: 25 [0/29460 (0%)]	Loss: 5.077
+Train Epoch: 25 [22400/29460 (77%)]	Loss: 5.082
+====> Epoch: 25 Avg loss: 5.0859
+====> TEST Epoch: 25 Avg loss: 5.1567
+Train Epoch: 26 [0/29460 (0%)]	Loss: 5.084
+Train Epoch: 26 [22400/29460 (77%)]	Loss: 5.077
+====> Epoch: 26 Avg loss: 5.0827
+====> TEST Epoch: 26 Avg loss: 5.1350
+Train Epoch: 27 [0/29460 (0%)]	Loss: 5.068
+Train Epoch: 27 [22400/29460 (77%)]	Loss: 5.064
+====> Epoch: 27 Avg loss: 5.0783
+====> TEST Epoch: 27 Avg loss: 5.1055
+Train Epoch: 28 [0/29460 (0%)]	Loss: 5.076
+Train Epoch: 28 [22400/29460 (77%)]	Loss: 5.101
+====> Epoch: 28 Avg loss: 5.0779
+====> TEST Epoch: 28 Avg loss: 5.1364
+Train Epoch: 29 [0/29460 (0%)]	Loss: 5.069
+Train Epoch: 29 [22400/29460 (77%)]	Loss: 5.090
+====> Epoch: 29 Avg loss: 5.0747
+====> TEST Epoch: 29 Avg loss: 5.1165
+Train Epoch: 30 [0/29460 (0%)]	Loss: 5.081
+Train Epoch: 30 [22400/29460 (77%)]	Loss: 5.068
+====> Epoch: 30 Avg loss: 5.0737
+====> TEST Epoch: 30 Avg loss: 5.1213
+Train Epoch: 31 [0/29460 (0%)]	Loss: 5.065
+Train Epoch: 31 [22400/29460 (77%)]	Loss: 5.070
+====> Epoch: 31 Avg loss: 5.0712
+====> TEST Epoch: 31 Avg loss: 5.1098
+Train Epoch: 32 [0/29460 (0%)]	Loss: 5.065
+Train Epoch: 32 [22400/29460 (77%)]	Loss: 5.067
+====> Epoch: 32 Avg loss: 5.0685
+====> TEST Epoch: 32 Avg loss: 5.1002
+Train Epoch: 33 [0/29460 (0%)]	Loss: 5.064
+Train Epoch: 33 [22400/29460 (77%)]	Loss: 5.060
+====> Epoch: 33 Avg loss: 5.0673
+====> TEST Epoch: 33 Avg loss: 5.1415
+Train Epoch: 34 [0/29460 (0%)]	Loss: 5.080
+Train Epoch: 34 [22400/29460 (77%)]	Loss: 5.055
+====> Epoch: 34 Avg loss: 5.0659
+====> TEST Epoch: 34 Avg loss: 5.1420
+Train Epoch: 35 [0/29460 (0%)]	Loss: 5.066
+Train Epoch: 35 [22400/29460 (77%)]	Loss: 5.075
+====> Epoch: 35 Avg loss: 5.0630
+====> TEST Epoch: 35 Avg loss: 5.1161
+Train Epoch: 36 [0/29460 (0%)]	Loss: 5.072
+Train Epoch: 36 [22400/29460 (77%)]	Loss: 5.067
+====> Epoch: 36 Avg loss: 5.0618
+====> TEST Epoch: 36 Avg loss: 5.1227
+Train Epoch: 37 [0/29460 (0%)]	Loss: 5.073
+Train Epoch: 37 [22400/29460 (77%)]	Loss: 5.053
+====> Epoch: 37 Avg loss: 5.0627
+====> TEST Epoch: 37 Avg loss: 5.1244
+Train Epoch: 38 [0/29460 (0%)]	Loss: 5.066
+Train Epoch: 38 [22400/29460 (77%)]	Loss: 5.037
+====> Epoch: 38 Avg loss: 5.0573
+====> TEST Epoch: 38 Avg loss: 5.1103
+Train Epoch: 39 [0/29460 (0%)]	Loss: 5.059
+Train Epoch: 39 [22400/29460 (77%)]	Loss: 5.075
+====> Epoch: 39 Avg loss: 5.0586
+====> TEST Epoch: 39 Avg loss: 5.1191
+Train Epoch: 40 [0/29460 (0%)]	Loss: 5.054
+Train Epoch: 40 [22400/29460 (77%)]	Loss: 5.060
+====> Epoch: 40 Avg loss: 5.0561
+====> TEST Epoch: 40 Avg loss: 5.1182
+Train Epoch: 41 [0/29460 (0%)]	Loss: 5.053
+Train Epoch: 41 [22400/29460 (77%)]	Loss: 5.055
+====> Epoch: 41 Avg loss: 5.0549
+====> TEST Epoch: 41 Avg loss: 5.0864
+Train Epoch: 42 [0/29460 (0%)]	Loss: 5.048
+Train Epoch: 42 [22400/29460 (77%)]	Loss: 5.051
+====> Epoch: 42 Avg loss: 5.0519
+====> TEST Epoch: 42 Avg loss: 5.1156
+Train Epoch: 43 [0/29460 (0%)]	Loss: 5.065
+Train Epoch: 43 [22400/29460 (77%)]	Loss: 5.067
+====> Epoch: 43 Avg loss: 5.0517
+====> TEST Epoch: 43 Avg loss: 5.1968
+Train Epoch: 44 [0/29460 (0%)]	Loss: 5.055
+Train Epoch: 44 [22400/29460 (77%)]	Loss: 5.060
+====> Epoch: 44 Avg loss: 5.0527
+====> TEST Epoch: 44 Avg loss: 5.1102
+Train Epoch: 45 [0/29460 (0%)]	Loss: 5.046
+Train Epoch: 45 [22400/29460 (77%)]	Loss: 5.054
+====> Epoch: 45 Avg loss: 5.0497
+====> TEST Epoch: 45 Avg loss: 5.0966
+Train Epoch: 46 [0/29460 (0%)]	Loss: 5.047
+Train Epoch: 46 [22400/29460 (77%)]	Loss: 5.050
+====> Epoch: 46 Avg loss: 5.0473
+====> TEST Epoch: 46 Avg loss: 5.1227
+Train Epoch: 47 [0/29460 (0%)]	Loss: 5.053
+Train Epoch: 47 [22400/29460 (77%)]	Loss: 5.050
+====> Epoch: 47 Avg loss: 5.0477
+====> TEST Epoch: 47 Avg loss: 5.0952
+Train Epoch: 48 [0/29460 (0%)]	Loss: 5.042
+Train Epoch: 48 [22400/29460 (77%)]	Loss: 5.061
+====> Epoch: 48 Avg loss: 5.0455
+====> TEST Epoch: 48 Avg loss: 5.0823
+Train Epoch: 49 [0/29460 (0%)]	Loss: 5.046
+Train Epoch: 49 [22400/29460 (77%)]	Loss: 5.045
+====> Epoch: 49 Avg loss: 5.0451
+====> TEST Epoch: 49 Avg loss: 5.1106
+Train Epoch: 50 [0/29460 (0%)]	Loss: 5.044
+Train Epoch: 50 [22400/29460 (77%)]	Loss: 5.030
+====> Epoch: 50 Avg loss: 5.0445
+====> TEST Epoch: 50 Avg loss: 5.1020
+Train Epoch: 51 [0/29460 (0%)]	Loss: 5.047
+Train Epoch: 51 [22400/29460 (77%)]	Loss: 5.038
+====> Epoch: 51 Avg loss: 5.0420
+====> TEST Epoch: 51 Avg loss: 5.0879
+Train Epoch: 52 [0/29460 (0%)]	Loss: 5.040
+Train Epoch: 52 [22400/29460 (77%)]	Loss: 5.045
+====> Epoch: 52 Avg loss: 5.0429
+====> TEST Epoch: 52 Avg loss: 5.1505
+Train Epoch: 53 [0/29460 (0%)]	Loss: 5.054
+Train Epoch: 53 [22400/29460 (77%)]	Loss: 5.048
+====> Epoch: 53 Avg loss: 5.0401
+====> TEST Epoch: 53 Avg loss: 5.0839
+Train Epoch: 54 [0/29460 (0%)]	Loss: 5.037
+Train Epoch: 54 [22400/29460 (77%)]	Loss: 5.040
+====> Epoch: 54 Avg loss: 5.0407
+====> TEST Epoch: 54 Avg loss: 5.0960
+Train Epoch: 55 [0/29460 (0%)]	Loss: 5.036
+Train Epoch: 55 [22400/29460 (77%)]	Loss: 5.038
+====> Epoch: 55 Avg loss: 5.0399
+====> TEST Epoch: 55 Avg loss: 5.0920
+Train Epoch: 56 [0/29460 (0%)]	Loss: 5.037
+Train Epoch: 56 [22400/29460 (77%)]	Loss: 5.049
+====> Epoch: 56 Avg loss: 5.0378
+====> TEST Epoch: 56 Avg loss: 5.0826
+Train Epoch: 57 [0/29460 (0%)]	Loss: 5.022
+Train Epoch: 57 [22400/29460 (77%)]	Loss: 5.031
+====> Epoch: 57 Avg loss: 5.0377
+====> TEST Epoch: 57 Avg loss: 5.0838
+Train Epoch: 58 [0/29460 (0%)]	Loss: 5.042
+Train Epoch: 58 [22400/29460 (77%)]	Loss: 5.031
+====> Epoch: 58 Avg loss: 5.0370
+====> TEST Epoch: 58 Avg loss: 5.1076
+Train Epoch: 59 [0/29460 (0%)]	Loss: 5.039
+Train Epoch: 59 [22400/29460 (77%)]	Loss: 5.026
+====> Epoch: 59 Avg loss: 5.0361
+====> TEST Epoch: 59 Avg loss: 5.0848
+Train Epoch: 60 [0/29460 (0%)]	Loss: 5.035
+Train Epoch: 60 [22400/29460 (77%)]	Loss: 5.027
+====> Epoch: 60 Avg loss: 5.0343
+====> TEST Epoch: 60 Avg loss: 5.0907
+Train Epoch: 61 [0/29460 (0%)]	Loss: 5.033
+Train Epoch: 61 [22400/29460 (77%)]	Loss: 5.029
+====> Epoch: 61 Avg loss: 5.0335
+====> TEST Epoch: 61 Avg loss: 5.0646
+Train Epoch: 62 [0/29460 (0%)]	Loss: 5.029
+Train Epoch: 62 [22400/29460 (77%)]	Loss: 5.023
+====> Epoch: 62 Avg loss: 5.0330
+====> TEST Epoch: 62 Avg loss: 5.1064
+Train Epoch: 63 [0/29460 (0%)]	Loss: 5.039
+Train Epoch: 63 [22400/29460 (77%)]	Loss: 5.035
+====> Epoch: 63 Avg loss: 5.0313
+====> TEST Epoch: 63 Avg loss: 5.0701
+Train Epoch: 64 [0/29460 (0%)]	Loss: 5.034
+Train Epoch: 64 [22400/29460 (77%)]	Loss: 5.046
+====> Epoch: 64 Avg loss: 5.0315
+====> TEST Epoch: 64 Avg loss: 5.0774
+Train Epoch: 65 [0/29460 (0%)]	Loss: 5.028
+Train Epoch: 65 [22400/29460 (77%)]	Loss: 5.026
+====> Epoch: 65 Avg loss: 5.0285
+====> TEST Epoch: 65 Avg loss: 5.0836
+Train Epoch: 66 [0/29460 (0%)]	Loss: 5.025
+Train Epoch: 66 [22400/29460 (77%)]	Loss: 5.023
+====> Epoch: 66 Avg loss: 5.0277
+====> TEST Epoch: 66 Avg loss: 5.0782
+Train Epoch: 67 [0/29460 (0%)]	Loss: 5.032
+Train Epoch: 67 [22400/29460 (77%)]	Loss: 5.020
+====> Epoch: 67 Avg loss: 5.0287
+====> TEST Epoch: 67 Avg loss: 5.0677
+Train Epoch: 68 [0/29460 (0%)]	Loss: 5.019
+Train Epoch: 68 [22400/29460 (77%)]	Loss: 5.027
+====> Epoch: 68 Avg loss: 5.0279
+====> TEST Epoch: 68 Avg loss: 5.1037
+Train Epoch: 69 [0/29460 (0%)]	Loss: 5.027
+Train Epoch: 69 [22400/29460 (77%)]	Loss: 5.022
+====> Epoch: 69 Avg loss: 5.0267
+====> TEST Epoch: 69 Avg loss: 5.0697
+Train Epoch: 70 [0/29460 (0%)]	Loss: 5.032
+Train Epoch: 70 [22400/29460 (77%)]	Loss: 5.021
+====> Epoch: 70 Avg loss: 5.0254
+====> TEST Epoch: 70 Avg loss: 5.0674
+Train Epoch: 71 [0/29460 (0%)]	Loss: 5.026
+Train Epoch: 71 [22400/29460 (77%)]	Loss: 5.022
+====> Epoch: 71 Avg loss: 5.0239
+====> TEST Epoch: 71 Avg loss: 5.0961
+Train Epoch: 72 [0/29460 (0%)]	Loss: 5.023
+Train Epoch: 72 [22400/29460 (77%)]	Loss: 5.020
+====> Epoch: 72 Avg loss: 5.0250
+====> TEST Epoch: 72 Avg loss: 5.0881
+Train Epoch: 73 [0/29460 (0%)]	Loss: 5.019
+Train Epoch: 73 [22400/29460 (77%)]	Loss: 5.027
+====> Epoch: 73 Avg loss: 5.0237
+====> TEST Epoch: 73 Avg loss: 5.0769
+Train Epoch: 74 [0/29460 (0%)]	Loss: 5.026
+Train Epoch: 74 [22400/29460 (77%)]	Loss: 5.022
+====> Epoch: 74 Avg loss: 5.0226
+====> TEST Epoch: 74 Avg loss: 5.0935
+Train Epoch: 75 [0/29460 (0%)]	Loss: 5.028
+Train Epoch: 75 [22400/29460 (77%)]	Loss: 5.019
+====> Epoch: 75 Avg loss: 5.0227
+====> TEST Epoch: 75 Avg loss: 5.0674
+Train Epoch: 76 [0/29460 (0%)]	Loss: 5.030
+Train Epoch: 76 [22400/29460 (77%)]	Loss: 5.016
+====> Epoch: 76 Avg loss: 5.0213
+====> TEST Epoch: 76 Avg loss: 5.0753
+Train Epoch: 77 [0/29460 (0%)]	Loss: 5.017
+Train Epoch: 77 [22400/29460 (77%)]	Loss: 5.023
+====> Epoch: 77 Avg loss: 5.0224
+====> TEST Epoch: 77 Avg loss: 5.0640
+Train Epoch: 78 [0/29460 (0%)]	Loss: 5.015
+Train Epoch: 78 [22400/29460 (77%)]	Loss: 5.025
+====> Epoch: 78 Avg loss: 5.0196
+====> TEST Epoch: 78 Avg loss: 5.0630
+Train Epoch: 79 [0/29460 (0%)]	Loss: 5.016
+Train Epoch: 79 [22400/29460 (77%)]	Loss: 5.028
+====> Epoch: 79 Avg loss: 5.0204
+====> TEST Epoch: 79 Avg loss: 5.0842
+Train Epoch: 80 [0/29460 (0%)]	Loss: 5.026
+Train Epoch: 80 [22400/29460 (77%)]	Loss: 5.014
+====> Epoch: 80 Avg loss: 5.0205
+====> TEST Epoch: 80 Avg loss: 5.0655
+Train Epoch: 81 [0/29460 (0%)]	Loss: 5.025
+Train Epoch: 81 [22400/29460 (77%)]	Loss: 5.020
+====> Epoch: 81 Avg loss: 5.0198
+====> TEST Epoch: 81 Avg loss: 5.0638
+Train Epoch: 82 [0/29460 (0%)]	Loss: 5.022
+Train Epoch: 82 [22400/29460 (77%)]	Loss: 5.021
+====> Epoch: 82 Avg loss: 5.0177
+====> TEST Epoch: 82 Avg loss: 5.0563
+Train Epoch: 83 [0/29460 (0%)]	Loss: 5.018
+Train Epoch: 83 [22400/29460 (77%)]	Loss: 5.021
+====> Epoch: 83 Avg loss: 5.0190
+====> TEST Epoch: 83 Avg loss: 5.0673
+Train Epoch: 84 [0/29460 (0%)]	Loss: 5.013
+Train Epoch: 84 [22400/29460 (77%)]	Loss: 5.017
+====> Epoch: 84 Avg loss: 5.0178
+====> TEST Epoch: 84 Avg loss: 5.0752
+Train Epoch: 85 [0/29460 (0%)]	Loss: 5.012
+Train Epoch: 85 [22400/29460 (77%)]	Loss: 5.019
+====> Epoch: 85 Avg loss: 5.0173
+====> TEST Epoch: 85 Avg loss: 5.1002
+Train Epoch: 86 [0/29460 (0%)]	Loss: 5.014
+Train Epoch: 86 [22400/29460 (77%)]	Loss: 5.019
+====> Epoch: 86 Avg loss: 5.0173
+====> TEST Epoch: 86 Avg loss: 5.0807
+Train Epoch: 87 [0/29460 (0%)]	Loss: 5.020
+Train Epoch: 87 [22400/29460 (77%)]	Loss: 5.017
+====> Epoch: 87 Avg loss: 5.0165
+====> TEST Epoch: 87 Avg loss: 5.0684
+Train Epoch: 88 [0/29460 (0%)]	Loss: 5.018
+Train Epoch: 88 [22400/29460 (77%)]	Loss: 5.015
+====> Epoch: 88 Avg loss: 5.0163
+====> TEST Epoch: 88 Avg loss: 5.0749
+Train Epoch: 89 [0/29460 (0%)]	Loss: 5.012
+Train Epoch: 89 [22400/29460 (77%)]	Loss: 5.018
+====> Epoch: 89 Avg loss: 5.0149
+====> TEST Epoch: 89 Avg loss: 5.1045
+Train Epoch: 90 [0/29460 (0%)]	Loss: 5.014
+Train Epoch: 90 [22400/29460 (77%)]	Loss: 5.014
+====> Epoch: 90 Avg loss: 5.0144
+====> TEST Epoch: 90 Avg loss: 5.0637
+Train Epoch: 91 [0/29460 (0%)]	Loss: 5.010
+Train Epoch: 91 [22400/29460 (77%)]	Loss: 5.013
+====> Epoch: 91 Avg loss: 5.0143
+====> TEST Epoch: 91 Avg loss: 5.0657
+Train Epoch: 92 [0/29460 (0%)]	Loss: 5.022
+Train Epoch: 92 [22400/29460 (77%)]	Loss: 5.013
+====> Epoch: 92 Avg loss: 5.0150
+====> TEST Epoch: 92 Avg loss: 5.0408
+Train Epoch: 93 [0/29460 (0%)]	Loss: 5.003
+Train Epoch: 93 [22400/29460 (77%)]	Loss: 5.011
+====> Epoch: 93 Avg loss: 5.0126
+====> TEST Epoch: 93 Avg loss: 5.0581
+Train Epoch: 94 [0/29460 (0%)]	Loss: 5.008
+Train Epoch: 94 [22400/29460 (77%)]	Loss: 5.010
+====> Epoch: 94 Avg loss: 5.0125
+====> TEST Epoch: 94 Avg loss: 5.0596
+Train Epoch: 95 [0/29460 (0%)]	Loss: 5.006
+Train Epoch: 95 [22400/29460 (77%)]	Loss: 5.017
+====> Epoch: 95 Avg loss: 5.0122
+====> TEST Epoch: 95 Avg loss: 5.0563
+Train Epoch: 96 [0/29460 (0%)]	Loss: 5.004
+Train Epoch: 96 [22400/29460 (77%)]	Loss: 5.003
+====> Epoch: 96 Avg loss: 5.0105
+====> TEST Epoch: 96 Avg loss: 5.0503
+Train Epoch: 97 [0/29460 (0%)]	Loss: 5.010
+Train Epoch: 97 [22400/29460 (77%)]	Loss: 5.010
+====> Epoch: 97 Avg loss: 5.0108
+====> TEST Epoch: 97 Avg loss: 5.0547
+Train Epoch: 98 [0/29460 (0%)]	Loss: 5.011
+Train Epoch: 98 [22400/29460 (77%)]	Loss: 5.012
+====> Epoch: 98 Avg loss: 5.0107
+====> TEST Epoch: 98 Avg loss: 5.0595
+Train Epoch: 99 [0/29460 (0%)]	Loss: 5.002
+Train Epoch: 99 [22400/29460 (77%)]	Loss: 5.015
+====> Epoch: 99 Avg loss: 5.0089
+====> TEST Epoch: 99 Avg loss: 5.0658
