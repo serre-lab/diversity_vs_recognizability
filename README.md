@@ -19,6 +19,9 @@ python3 1_train_vaestn.py --device cuda:0 --z_size 80 --time_step 100 --out_dir 
 ```
 Do not forget to change `--out_dir` and `--dataset_root` args to your saving path and data path (omniglot). If you want to reproduce all the VAE-STN models presented in Fig. 3a (light blue data points), you need to run this command line and vary `--beta` from 0 to 4 (step 0.25),   `--time_step` from 20 to 90 (step 10) and `--z_size` from 10 to 400 (step 25).
 
+Here is a gif of the one-shot generation made by the vae-stn
+<img src="trained_model/vae_stn/vae_stn_exemple/fig/anim_gene.gif" height="300" />
+
 ### VAE-NS (Neural Statistician [3])
 ```
 python3 1_train_NS.py --device cuda:0 --model_name ns --sample-size 5 --z-dim 16 --exemplar --epoch 300 --learning_rate 1e-3 --beta 1 --out_dir outdir --dataset_root dataset_root
@@ -26,8 +29,7 @@ python3 1_train_NS.py --device cuda:0 --model_name ns --sample-size 5 --z-dim 16
 ```
 Do not forget to change `--out_dir` and `--dataset_root` args to your saving path and data path (omniglot). If you want ot reproduce all the VAE-NS models presented in Fig3. a, run this command line and vary `--sample-size` from 2 to 20 (step 1), `--beta` from 0 to 5 (step 0.25) and `--z_size` from 0 to 100 (step 10)
 
-Here is a gif of the one-shot generation made by the vae-stn
-<img src="https://media.giphy.com/media/vFKqnCdLPNOKc/giphy.gif" width="40" height="40" />
+
 
 ### DAGAN (Data Augmentation GAN [4])
 To train the version using the ResNet Architecture (i.e. DA-GAN-RN)
