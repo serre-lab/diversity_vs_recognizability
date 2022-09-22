@@ -1,8 +1,13 @@
 import torch
 import os
-from model.few_shot import ProtoNet
+from model.few_shot import ProtoNet, compute_prototypes, pairwise_distances
 from model.simclr import ImageEmbedding
 from utils.loading_tools import load_weights, load_net
+import math
+import torch.nn as nn
+from collections import OrderedDict
+
+
 
 
 def load_embedding(model_name='', path_to_embedding='', device='cpu', image_size=50):
@@ -102,3 +107,68 @@ def interclass_variability(type='l2'):
     else :
         raise NotImplementedError()
     return measure
+
+
+def generate_evaluation_task(args, batch_stop= None, nb_test=500, nb_class=150, seed=44):
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    all_label = torch.arange(nb_class)
+    if batch_stop is not None:
+        all_label = all_label[:batch_stop]
+
+    fixed_task = []
+
+    label_extended = all_label.repeat(nb_test)
+    range1 = (len(all_label) // args.k_test) * args.k_test
+    nb_range_1 = int(math.ceil(label_extended.size(0) / range1))
+
+    for i_r_1 in range(nb_range_1):
+        if i_r_1 == nb_range_1 - 1:
+            int_lab = label_extended[i_r_1 * range1:]
+        else:
+            int_lab = label_extended[i_r_1 * range1: (i_r_1 + 1) * range1]
+
+        int_lab = int_lab[torch.randperm(int_lab.size(0))]
+        if int_lab.size(0) % args.k_test != 0:
+            raise Exception("int lab not divisible size ({0}) by k_way ({1})".format(int_lab.size(0), args.k_test))
+        nb_range_2 = int_lab.size(0) // args.k_test
+
+        for i_r_2 in range(nb_range_2):
+            fixed_task.append(int_lab[i_r_2 * args.k_test: (i_r_2 + 1) * args.k_test].numpy())
+
+    return fixed_task
+
+
+def classifier_prediction(path_to_classifier, classifier_name, device, args):
+        #model, model_name, device, args
+
+    few_shot_args, few_shot_weights = load_weights(
+            path_to_classifier,
+            classifier_name,
+            mode='best')
+
+    if (few_shot_args.model_name == 'proto_net'):
+
+        few_shot_model = ProtoNet(z_size=few_shot_args.z_size, num_input_channels=1).to(device)
+        check_args = (args.k_test == few_shot_args.k_test) and \
+                     (args.n_test == few_shot_args.n_test) and \
+                     (args.q_test == few_shot_args.q_test)
+        if not check_args:
+            raise NameError('the dataset args and the network args are not the same')
+        few_shot_model.load_state_dict(few_shot_weights)
+        few_shot_model.eval()
+
+        def predict(image):
+            _, metric_layer = few_shot_model(image)
+            support = metric_layer[:few_shot_args.n_test * few_shot_args.k_test]
+            queries = metric_layer[few_shot_args.n_test * few_shot_args.k_test:]
+            prototypes = compute_prototypes(support, few_shot_args.k_test, few_shot_args.n_test)
+            distances = pairwise_distances(queries, prototypes, few_shot_args.distance)
+            y_pred = (-distances).softmax(dim=1)
+            return y_pred, distances
+
+    else:
+        raise NotImplementedError()
+
+    return predict

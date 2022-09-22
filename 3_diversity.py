@@ -17,17 +17,9 @@ import os
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='omniglot', choices=['omniglot'],
                     metavar='DATASET', help='Dataset choice.')
-#parser.add_argument('--out_dir', type=str, default='/media/data_cifs/projects/prj_zero_gene/exp/',
-#                    metavar='OUT_DIR', help='output directory for model saving etc.')
 parser.add_argument('--device', type=str, default='cuda:0', help='cuda device')
 parser.add_argument('--input_type', type=str, default='binary',
                     choices=['binary'], help='type of the input')
-#parser.add_argument('--learning_rate', type=float, default=1e-3, metavar='LR',
-#                    help='learning rate of the optimizer')
-#parser.add_argument('--seed', type=int, default=None, metavar='SEED', help='random seed (None is no seed)')
-#parser.add_argument('--epoch', type=int, default=200, metavar='EPOCH', help='number of epoch')
-#parser.add_argument('--debug', default=False, action='store_true', help='debugging flag (do not save the network)')
-#parser.add_argument('--tag', type=str, default='', help='tag of the experiment')
 parser.add_argument("--input_shape", nargs='+', type=int, default=[1, 50, 50],
                     help='shape of the input [channel, height, width]')
 parser.add_argument('--download_data', type=eval, default=False, choices=[True, False])

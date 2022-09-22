@@ -1,0 +1,836 @@
+/mnt/md0/home/vboutin/prj_zero_gene/train_fewshot.py
+import argparse
+import torch
+from utils.monitoring import make_directories, compute_parameter_grad, get_logger, \
+    plot_gif, visualize, plot_img, str2bool, visual_evaluation
+from evaluation_utils.generative_models import load_reco_model
+#from utils.loading_tools import normalise_args
+from utils.data_loader import load_dataset_exemplar
+# from model.old_network import SeqVaeCond, SeqVaeCondGeneral, SeqVaeCondGeneral2_4chan
+
+from torch import optim
+import torch.nn as nn
+import numpy as np
+import random
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
+from few_shot.models import get_few_shot_encoder, ProtoNet, ProtoNetNormalize
+
+from model.param import retrieve_param
+from torch.optim import Adam
+from few_shot.utils_few_shot import pairwise_distances
+from few_shot.proto import compute_prototypes
+from utils.loading_tools import load_weights, load_net
+from utils.custom_transform import Binarize_batch, Scale_0_1_batch
+from model.network import SeqVaeCondGeneral2b
+
+
+# torch.backends.cudnn.enabled = False
+
+
+# --dataset mnist --batch_size 28 --z_size 5 --seed 75 --device cuda:1 --debug --lstm_size 400 --epoch 5
+# python 1_train_vae.py --dataset omniglot_weak --auto_param --device cuda:2 --model_name vae_stn --exemplar --time_step 80 --tag CondGeneral2c_LstmSize400_TimeStep80_batch_size28_GlobalInit
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--z_size', type=int, default=128)
+parser.add_argument('--dataset', type=str, default='omniglot_weak', choices=['omniglot', 'omniglot_weak', 'mnist', 'human_drawing',
+                                                                             'human_drawing_and_omniglot', 'quick_draw',
+                                                                             'human_drawing_and_quick_draw'],
+                    metavar='DATASET', help='Dataset choice.')
+parser.add_argument('--download_data', type=eval, default=False, choices=[True, False])
+parser.add_argument('--dataset_root', type=str, default="/media/data_cifs_lrs/projects/prj_control/data")
+parser.add_argument('--input_type', type=str, default='binary',
+                    choices=['binary'], help='type of the input')
+parser.add_argument('--batch_size', type=int, default=128, metavar='BATCH_SIZE',
+                    help='input batch size for training')
+parser.add_argument('--learning_rate', type=float, default=1e-3, metavar='LR',
+                    help='learning rate of the optimizer')
+parser.add_argument('--seed', type=int, default=None, metavar='SEED', help='random seed (None is no seed)')
+parser.add_argument('--epoch', type=int, default=80, metavar='EPOCH', help='number of epoch')
+
+parser.add_argument("--input_shape", nargs='+', type=int, default=[1, 50, 50],
+                    help='shape of the input [channel, height, width]')
+parser.add_argument('-od', '--out_dir', type=str, default='/media/data_cifs/projects/prj_zero_gene/exp/',
+                    metavar='OUT_DIR', help='output directory for model snapshots etc.')
+parser.add_argument('--debug', default=False, action='store_true', help='debugging flag (do not save the network)')
+#parser.add_argument('--beta_adam', type=float, default=0.9, help='value of the first order beta in adam optimizer')
+
+parser.add_argument('--device', type=str, default='cuda:0', help='cuda device')
+parser.add_argument('--tag', type=str, default='', help='tag of the experiment')
+#parser.add_argument("--exemplar", type=str2bool, nargs='?', const=True, default=True, help="For conditional VAE")
+parser.add_argument('--model_name', type=str, default='proto_net', choices=['proto_net', 'proto_net_normalize'],
+                    help="type of the model ['vae_stn', 'vae_draw']")
+parser.add_argument('--auto_param', default=False, action='store_true', help='set all the param automatically')
+parser.add_argument("--augment", type=str2bool, nargs='?', const=True, default=False, help="data augmentation")
+parser.add_argument("--exemplar_type", default='prototype', choices=['prototype', 'first', 'shuffle'],
+                    metavar='EX_TYPE', help='type of exemplar')
+
+parser.add_argument('--preload', default=False, action='store_true', help='preload the dataset')
+#parser.add_argument("--shuffle_exemplar", type=str2bool, nargs='?', const=True, default=False, help="shuffle the exemplar")
+#parser.add_argument("--rate_scheduler", type=str2bool, nargs='?', const=True, default=False, help="include a rate scheduler")
+parser.add_argument('--drop_lr_every', default=20, type=int)
+parser.add_argument('--episodes_per_epoch', default=100, type=int)
+parser.add_argument('--evaluation_episodes', default=1000, type=int)
+parser.add_argument('--distance', default='l2')
+parser.add_argument('--n-train', default=1, type=int) #n shots
+parser.add_argument('--n-test', default=1, type=int) #n shots
+parser.add_argument('--k-train', default=60, type=int) #k ways
+parser.add_argument('--k-test', default=20, type=int) #k ways
+parser.add_argument('--q-train', default=5, type=int) #query
+parser.add_argument('--q-test', default=1, type=int) #query
+parser.add_argument('--gene_type', type=str, default='reco', choices=['reco', 'gene'])
+parser.add_argument("--generative_model", nargs='+', type=str, default=[''],
+                    help='list of the generative algorithms we want to use for training')
+#parser.add_argument('--generative_model', type=str, default=None,
+#                    metavar='gen_model', help='name of the generative model to load')
+#parser.add_argument('--generative_model_dir', type=str, default=None,
+#                    metavar='gen_model_dir', help='name of the generative model to load')
+
+
+
+#args = normalize_args(args)
+
+args = parser.parse_args()
+args.generative_model = tuple(args.generative_model)
+args.input_shape = tuple(args.input_shape)
+
+#args.generative_model = ('vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta0.8_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_05_exVAE_z40_T80_rs10_rs10_beta1.0_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta1.4_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta2.0_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta2.5_rc_vae_stn13',
+#                         'vae_stn_stn_2022-02-20_11_44_04_exVAE_z40_T80_rs10_rs10_beta3.0_rc_vae_stn13')
+
+#args.generative_model = ('vae_stn_stn_2022-02-20_11_44_05_exVAE_z40_T80_rs10_rs10_beta1.0_rc_vae_stn13',)
+
+if args.device == 'meso':
+    args.device = torch.cuda.current_device()
+
+
+
+#if args.generative_model is not None:
+#    gen_model_args, gen_model_weights = load_weights(
+#        '/media/data_cifs/projects/prj_zero_gene/oscar_simu/omniglot/vae_stn6/', args.generative_model, mode='best')
+#    gen_model_args.device = args.device
+#    gen_model = load_net(gen_model_args)
+#    gen_model = gen_model.to(args.device)
+#    #gen_model = SeqVaeCondGeneral2b(gen_model_args).to(args.device)
+#    gen_model.load_state_dict(gen_model_weights)
+#    gen_model.eval()
+
+
+default_args = parser.parse_args([])
+#if args.auto_param:
+#    args = retrieve_param(args, default_args)
+if args.seed is not None:
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+if args.generative_model != ('',):
+    print(args.generative_model)
+    #args.q_train = args.q_train*(len(args.generative_model)+1)
+    #batch_size_loss = (len(args.generative_model) + 1) * args.batch_size
+    all_reco_function = []
+    scale_01, binarize = Scale_0_1_batch(), Binarize_batch(binary_threshold=0.5)
+    with torch.no_grad():
+        for generative_models in args.generative_model:
+            one_reco_function = load_reco_model(model='vae_stn', model_name = generative_models, device=args.device)
+            all_reco_function.append(one_reco_function)
+else:
+    #batch_size_loss = args.batch_size
+    print('no generative models')
+
+
+if args.debug:
+    visual_steps, monitor_steps = 1, 10 # 50
+else:
+    visual_steps, monitor_steps = 10, 25
+
+args = make_directories(args, 'few_shot')
+kwargs = {'preload': args.preload}
+
+#train_loader, test_loader, train_exemplars, test_exemplars, args = load_dataset_exemplar(args, shape=args.input_shape, **kwargs)
+train_loader, test_loader, args = load_dataset_exemplar(args, shape=args.input_shape, few_shot=True, **kwargs)
+
+#model = get_few_shot_encoder(args.input_shape[0])
+if args.model_name == 'proto_net':
+    model = ProtoNet(z_size=args.z_size)
+elif args.model_name == 'proto_net_normalize':
+    model = ProtoNetNormalize(z_size=args.z_size)
+model.to(args.device)
+
+optimizer = Adam(model.parameters(), lr=args.learning_rate)
+loss_fn = torch.nn.NLLLoss().cuda()
+
+
+scheduler = StepLR(optimizer, step_size=args.drop_lr_every, gamma=0.5)
+
+if not args.debug:
+    logger = get_logger(args, __file__)
+    writer = SummaryWriter(args.snap_dir)
+else:
+    logger = None
+    writer = None
+
+print(model)
+print('number of parameters : {0:,}'.format(sum(p.numel() for p in model.parameters())))
+
+
+best_loss = np.inf
+for epoch in range(1, args.epoch+1):
+    model.train()
+    train_loss, train_accu = 0, 0
+    nb_queries = args.q_train * args.k_train
+    for batch_idx, (data, exemplar, label) in enumerate(train_loader):
+        exemplar = exemplar.to(args.device)
+        data = data.to(args.device)
+        support = exemplar[:args.n_train*args.k_train]
+        label = torch.arange(0, args.k_train, 1 / args.q_train).long().to(args.device)
+        if args.generative_model != ('',):
+            query = []
+            all_label = []
+            with torch.no_grad():
+                for idx_model, generative_models in enumerate(args.generative_model):
+                    reco = all_reco_function[idx_model](data[args.n_train*args.k_train:], exemplar[args.n_train*args.k_train:])
+                    query.append(reco)
+                    all_label.append(label)
+                query.append(data[args.n_train*args.k_train:])
+                all_label.append(label)
+                query = torch.cat(query, dim=0)
+                all_label = torch.cat(all_label, dim=0)
+                query = binarize(scale_01(query))
+        else:
+            query = data[args.n_train*args.k_train:]
+            all_label = label
+
+        data_to_pass = torch.cat([support,query], dim=0)
+        #if args.generative_model is not None:
+        #    #filter = torch.randperm(nb_queries)[0:nb_queries//2]
+        #    filter = torch.arange(nb_queries)
+        #    queries_input = data[args.n_train * args.k_train:][filter]
+        #    queries_exemplar = exemplar[args.n_train * args.k_train:][filter]
+        #    if args.gene_type == 'reco':
+        #        _, _, reco, _, _, _, _ = gen_model(queries_input, exemplar=queries_exemplar, low_memory=True)
+        #    elif args.gene_type == 'gene':
+        #        reco, _, _ = gen_model.generate(queries_exemplar.size(0), exemplar=queries_exemplar, low_memory=True)
+        #    data[args.n_train * args.k_train:][filter] = reco
+
+        #label = torch.arange(0, args.k_train, 1 / args.q_train).long().to(args.device)
+        optimizer.zero_grad()
+
+        #embeddings = model(data)
+        features, last_layer = model(data_to_pass)
+
+        support = last_layer[:args.n_train * args.k_train]
+        queries = last_layer[args.n_train * args.k_train:]
+
+        prototypes = compute_prototypes(support, args.k_train, args.n_train)
+        distances = pairwise_distances(queries, prototypes, args.distance)
+
+        # Calculate log p_{phi} (y = k | x)
+        log_p_y = (-distances).log_softmax(dim=1)
+        loss = loss_fn(log_p_y, all_label)
+
+        # Prediction probabilities are softmax over distances
+        y_pred = (-distances).softmax(dim=1)
+
+        loss.backward()
+        optimizer.step()
+
+        pred = y_pred.argmax(dim=1)
+
+        correct = pred.eq(all_label)
+        accu = 100*(correct.sum().float()/torch.numel(correct)).item()
+        train_accu += accu
+        train_loss += loss.item()
+
+        if batch_idx % monitor_steps == 0:
+            to_print = 'Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.3f}\t%: {:.2f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader),
+                       loss.item(),
+                       accu,
+                       )
+            if args.debug:
+                print(to_print)
+            else:
+                logger.info(to_print)
+
+    train_loss /= len(train_loader)
+    train_accu /= len(train_loader)
+
+    to_print = '====> Epoch: {} Avg loss: {:.4f} -- Accu {:.2f}'.format(
+        epoch, train_loss,
+        train_accu)
+
+    if args.debug:
+        print(to_print)
+    else:
+        logger.info(to_print)
+
+    if writer is not None:
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Accu/train", train_accu, epoch)
+
+
+
+
+    model.eval()
+    eval_loss, eval_accu = 0, 0
+    nb_queries = args.q_test * args.k_test
+    for batch_idx, (data, exemplar, label) in enumerate(test_loader):
+        data = data.to(args.device)
+        exemplar = exemplar.to(args.device)
+        support = exemplar[:args.n_test * args.k_test]
+        label = torch.arange(0, args.k_test, 1 / args.q_test).long().to(args.device)
+
+        if args.generative_model != ('',):
+            query = []
+            all_label = []
+            with torch.no_grad():
+                for idx_model, generative_models in enumerate(args.generative_model):
+                    reco = all_reco_function[idx_model](data[args.n_test*args.k_test:], exemplar[args.n_test*args.k_test:])
+                    query.append(reco)
+                    all_label.append(label)
+                query.append(data[args.n_test*args.k_test:])
+                all_label.append(label)
+                query = torch.cat(query, dim=0)
+                all_label = torch.cat(all_label, dim=0)
+                query = binarize(scale_01(query))
+        else:
+            query = data[args.n_test*args.k_test:]
+            all_label = label
+
+        data_to_pass = torch.cat([support, query], dim=0)
+        features, last_layer = model(data_to_pass)
+
+        support = last_layer[:args.n_test * args.k_test]
+        queries = last_layer[args.n_test * args.k_test:]
+        prototypes = compute_prototypes(support, args.k_test, args.n_test)
+        distances = pairwise_distances(queries, prototypes, args.distance)
+
+
+        log_p_y = (-distances).log_softmax(dim=1)
+        loss = loss_fn(log_p_y, all_label)
+
+        # Prediction probabilities are softmax over distances
+        y_pred = (-distances).softmax(dim=1)
+        pred = y_pred.argmax(dim=1)
+
+        correct = pred.eq(all_label)
+        accu = 100 * (correct.sum().float() / torch.numel(correct)).item()
+        eval_accu += accu
+        eval_loss += loss.item()
+    eval_loss /= len(test_loader)
+    eval_accu /= len(test_loader)
+
+    to_print = '====> TEST Epoch: {} Avg loss: {:.4f} -- Avg Accu {:.2f}'.format(
+        epoch, eval_loss,
+        eval_accu)
+
+    if not args.debug:
+        torch.save(model.state_dict(), args.snap_dir + '_end.model')
+
+    if args.debug:
+        print(to_print)
+    else:
+        logger.info(to_print)
+
+    if writer is not None:
+        writer.add_scalar("Loss/eval", eval_loss, epoch)
+        writer.add_scalar("Accu/eval", eval_accu, epoch)
+        writer.add_scalar("rate", optimizer.param_groups[0]['lr'], epoch)
+
+    if eval_loss < best_loss:
+        if not args.debug:
+            torch.save(model.state_dict(), args.snap_dir + '_best.model')
+        best_loss = eval_loss
+    scheduler.step()
+
+
+
+
+
+Namespace(augment=False, auto_param=True, batch_size=128, dataset='omniglot', dataset_root='/media/data_cifs_lrs/projects/prj_control/data', debug=False, device='cuda:2', distance='l2', download_data=False, drop_lr_every=20, episodes_per_epoch=100, epoch=80, evaluation_episodes=1000, exemplar_type='prototype', fig_dir='/media/data_cifs/projects/prj_zero_gene/exp/omniglot/few_shot/proto_net_2022-04-05_18_59_39_z256/fig/', gene_type='reco', generative_model=('',), input_shape=(1, 50, 50), input_type='binary', k_test=20, k_train=60, learning_rate=0.001, model_name='proto_net', model_signature='proto_net_2022-04-05_18_59_39_z256', n_test=1, n_train=1, out_dir='/media/data_cifs/projects/prj_zero_gene/exp/', preload=True, q_test=1, q_train=5, seed=None, snap_dir='/media/data_cifs/projects/prj_zero_gene/exp/omniglot/few_shot/proto_net_2022-04-05_18_59_39_z256/', tag='', z_size=256)
+PID 3300191
+Train Epoch: 1 [0/29460 (0%)]	Loss: 2.545	%: 35.00
+Train Epoch: 1 [9000/29460 (25%)]	Loss: 0.724	%: 79.67
+Train Epoch: 1 [18000/29460 (50%)]	Loss: 0.318	%: 88.33
+Train Epoch: 1 [27000/29460 (75%)]	Loss: 0.345	%: 89.00
+====> Epoch: 1 Avg loss: 0.5628 -- Accu 84.03
+====> TEST Epoch: 1 Avg loss: 0.1592 -- Avg Accu 95.45
+Train Epoch: 2 [0/29460 (0%)]	Loss: 0.360	%: 89.00
+Train Epoch: 2 [9000/29460 (25%)]	Loss: 0.249	%: 92.33
+Train Epoch: 2 [18000/29460 (50%)]	Loss: 0.304	%: 90.67
+Train Epoch: 2 [27000/29460 (75%)]	Loss: 0.249	%: 94.00
+====> Epoch: 2 Avg loss: 0.2411 -- Accu 92.82
+====> TEST Epoch: 2 Avg loss: 0.1546 -- Avg Accu 95.40
+Train Epoch: 3 [0/29460 (0%)]	Loss: 0.199	%: 93.00
+Train Epoch: 3 [9000/29460 (25%)]	Loss: 0.179	%: 95.00
+Train Epoch: 3 [18000/29460 (50%)]	Loss: 0.163	%: 93.00
+Train Epoch: 3 [27000/29460 (75%)]	Loss: 0.118	%: 97.33
+====> Epoch: 3 Avg loss: 0.1684 -- Accu 94.76
+====> TEST Epoch: 3 Avg loss: 0.1003 -- Avg Accu 96.70
+Train Epoch: 4 [0/29460 (0%)]	Loss: 0.189	%: 94.33
+Train Epoch: 4 [9000/29460 (25%)]	Loss: 0.198	%: 95.00
+Train Epoch: 4 [18000/29460 (50%)]	Loss: 0.146	%: 95.33
+Train Epoch: 4 [27000/29460 (75%)]	Loss: 0.177	%: 93.67
+====> Epoch: 4 Avg loss: 0.1432 -- Accu 95.58
+====> TEST Epoch: 4 Avg loss: 0.1333 -- Avg Accu 96.30
+Train Epoch: 5 [0/29460 (0%)]	Loss: 0.117	%: 95.33
+Train Epoch: 5 [9000/29460 (25%)]	Loss: 0.121	%: 95.67
+Train Epoch: 5 [18000/29460 (50%)]	Loss: 0.128	%: 96.67
+Train Epoch: 5 [27000/29460 (75%)]	Loss: 0.176	%: 94.67
+====> Epoch: 5 Avg loss: 0.1197 -- Accu 96.03
+====> TEST Epoch: 5 Avg loss: 0.1585 -- Avg Accu 96.10
+Train Epoch: 6 [0/29460 (0%)]	Loss: 0.107	%: 95.67
+Train Epoch: 6 [9000/29460 (25%)]	Loss: 0.066	%: 98.00
+Train Epoch: 6 [18000/29460 (50%)]	Loss: 0.125	%: 96.00
+Train Epoch: 6 [27000/29460 (75%)]	Loss: 0.101	%: 97.33
+====> Epoch: 6 Avg loss: 0.1099 -- Accu 96.45
+====> TEST Epoch: 6 Avg loss: 0.1333 -- Avg Accu 96.95
+Train Epoch: 7 [0/29460 (0%)]	Loss: 0.086	%: 96.67
+Train Epoch: 7 [9000/29460 (25%)]	Loss: 0.056	%: 98.33
+Train Epoch: 7 [18000/29460 (50%)]	Loss: 0.077	%: 97.00
+Train Epoch: 7 [27000/29460 (75%)]	Loss: 0.090	%: 96.67
+====> Epoch: 7 Avg loss: 0.1002 -- Accu 96.69
+====> TEST Epoch: 7 Avg loss: 0.1395 -- Avg Accu 96.40
+Train Epoch: 8 [0/29460 (0%)]	Loss: 0.136	%: 96.00
+Train Epoch: 8 [9000/29460 (25%)]	Loss: 0.132	%: 96.67
+Train Epoch: 8 [18000/29460 (50%)]	Loss: 0.103	%: 95.67
+Train Epoch: 8 [27000/29460 (75%)]	Loss: 0.160	%: 94.00
+====> Epoch: 8 Avg loss: 0.0927 -- Accu 96.99
+====> TEST Epoch: 8 Avg loss: 0.0993 -- Avg Accu 97.00
+Train Epoch: 9 [0/29460 (0%)]	Loss: 0.077	%: 96.33
+Train Epoch: 9 [9000/29460 (25%)]	Loss: 0.054	%: 97.00
+Train Epoch: 9 [18000/29460 (50%)]	Loss: 0.071	%: 97.33
+Train Epoch: 9 [27000/29460 (75%)]	Loss: 0.110	%: 96.67
+====> Epoch: 9 Avg loss: 0.0843 -- Accu 97.13
+====> TEST Epoch: 9 Avg loss: 0.1361 -- Avg Accu 96.15
+Train Epoch: 10 [0/29460 (0%)]	Loss: 0.079	%: 98.67
+Train Epoch: 10 [9000/29460 (25%)]	Loss: 0.101	%: 97.00
+Train Epoch: 10 [18000/29460 (50%)]	Loss: 0.069	%: 97.33
+Train Epoch: 10 [27000/29460 (75%)]	Loss: 0.129	%: 96.00
+====> Epoch: 10 Avg loss: 0.0791 -- Accu 97.45
+====> TEST Epoch: 10 Avg loss: 0.1561 -- Avg Accu 96.65
+Train Epoch: 11 [0/29460 (0%)]	Loss: 0.085	%: 96.67
+Train Epoch: 11 [9000/29460 (25%)]	Loss: 0.031	%: 99.00
+Train Epoch: 11 [18000/29460 (50%)]	Loss: 0.108	%: 97.33
+Train Epoch: 11 [27000/29460 (75%)]	Loss: 0.063	%: 98.00
+====> Epoch: 11 Avg loss: 0.0798 -- Accu 97.34
+====> TEST Epoch: 11 Avg loss: 0.1450 -- Avg Accu 97.45
+Train Epoch: 12 [0/29460 (0%)]	Loss: 0.107	%: 97.33
+Train Epoch: 12 [9000/29460 (25%)]	Loss: 0.077	%: 96.00
+Train Epoch: 12 [18000/29460 (50%)]	Loss: 0.078	%: 97.00
+Train Epoch: 12 [27000/29460 (75%)]	Loss: 0.062	%: 97.67
+====> Epoch: 12 Avg loss: 0.0804 -- Accu 97.33
+====> TEST Epoch: 12 Avg loss: 0.1496 -- Avg Accu 96.15
+Train Epoch: 13 [0/29460 (0%)]	Loss: 0.042	%: 98.67
+Train Epoch: 13 [9000/29460 (25%)]	Loss: 0.036	%: 98.33
+Train Epoch: 13 [18000/29460 (50%)]	Loss: 0.082	%: 97.67
+Train Epoch: 13 [27000/29460 (75%)]	Loss: 0.103	%: 95.33
+====> Epoch: 13 Avg loss: 0.0681 -- Accu 97.78
+====> TEST Epoch: 13 Avg loss: 0.1221 -- Avg Accu 96.95
+Train Epoch: 14 [0/29460 (0%)]	Loss: 0.068	%: 98.67
+Train Epoch: 14 [9000/29460 (25%)]	Loss: 0.062	%: 98.33
+Train Epoch: 14 [18000/29460 (50%)]	Loss: 0.065	%: 97.67
+Train Epoch: 14 [27000/29460 (75%)]	Loss: 0.135	%: 94.67
+====> Epoch: 14 Avg loss: 0.0727 -- Accu 97.51
+====> TEST Epoch: 14 Avg loss: 0.1359 -- Avg Accu 96.70
+Train Epoch: 15 [0/29460 (0%)]	Loss: 0.087	%: 96.33
+Train Epoch: 15 [9000/29460 (25%)]	Loss: 0.089	%: 98.33
+Train Epoch: 15 [18000/29460 (50%)]	Loss: 0.051	%: 98.00
+Train Epoch: 15 [27000/29460 (75%)]	Loss: 0.132	%: 96.00
+====> Epoch: 15 Avg loss: 0.0689 -- Accu 97.65
+====> TEST Epoch: 15 Avg loss: 0.1791 -- Avg Accu 95.55
+Train Epoch: 16 [0/29460 (0%)]	Loss: 0.037	%: 99.00
+Train Epoch: 16 [9000/29460 (25%)]	Loss: 0.049	%: 97.00
+Train Epoch: 16 [18000/29460 (50%)]	Loss: 0.044	%: 98.67
+Train Epoch: 16 [27000/29460 (75%)]	Loss: 0.026	%: 99.33
+====> Epoch: 16 Avg loss: 0.0581 -- Accu 98.08
+====> TEST Epoch: 16 Avg loss: 0.1282 -- Avg Accu 97.05
+Train Epoch: 17 [0/29460 (0%)]	Loss: 0.079	%: 97.67
+Train Epoch: 17 [9000/29460 (25%)]	Loss: 0.100	%: 94.33
+Train Epoch: 17 [18000/29460 (50%)]	Loss: 0.103	%: 96.67
+Train Epoch: 17 [27000/29460 (75%)]	Loss: 0.072	%: 97.67
+====> Epoch: 17 Avg loss: 0.0645 -- Accu 97.90
+====> TEST Epoch: 17 Avg loss: 0.2011 -- Avg Accu 96.55
+Train Epoch: 18 [0/29460 (0%)]	Loss: 0.037	%: 99.00
+Train Epoch: 18 [9000/29460 (25%)]	Loss: 0.111	%: 98.00
+Train Epoch: 18 [18000/29460 (50%)]	Loss: 0.013	%: 99.67
+Train Epoch: 18 [27000/29460 (75%)]	Loss: 0.056	%: 96.33
+====> Epoch: 18 Avg loss: 0.0566 -- Accu 98.09
+====> TEST Epoch: 18 Avg loss: 0.1679 -- Avg Accu 97.15
+Train Epoch: 19 [0/29460 (0%)]	Loss: 0.041	%: 98.33
+Train Epoch: 19 [9000/29460 (25%)]	Loss: 0.046	%: 99.00
+Train Epoch: 19 [18000/29460 (50%)]	Loss: 0.083	%: 98.67
+Train Epoch: 19 [27000/29460 (75%)]	Loss: 0.083	%: 97.00
+====> Epoch: 19 Avg loss: 0.0527 -- Accu 98.25
+====> TEST Epoch: 19 Avg loss: 0.1889 -- Avg Accu 96.65
+Train Epoch: 20 [0/29460 (0%)]	Loss: 0.051	%: 97.67
+Train Epoch: 20 [9000/29460 (25%)]	Loss: 0.061	%: 96.67
+Train Epoch: 20 [18000/29460 (50%)]	Loss: 0.048	%: 98.67
+Train Epoch: 20 [27000/29460 (75%)]	Loss: 0.140	%: 97.67
+====> Epoch: 20 Avg loss: 0.0537 -- Accu 98.11
+====> TEST Epoch: 20 Avg loss: 0.1763 -- Avg Accu 96.70
+Train Epoch: 21 [0/29460 (0%)]	Loss: 0.090	%: 96.33
+Train Epoch: 21 [9000/29460 (25%)]	Loss: 0.018	%: 99.67
+Train Epoch: 21 [18000/29460 (50%)]	Loss: 0.069	%: 97.33
+Train Epoch: 21 [27000/29460 (75%)]	Loss: 0.027	%: 98.67
+====> Epoch: 21 Avg loss: 0.0367 -- Accu 98.65
+====> TEST Epoch: 21 Avg loss: 0.1558 -- Avg Accu 96.90
+Train Epoch: 22 [0/29460 (0%)]	Loss: 0.007	%: 100.00
+Train Epoch: 22 [9000/29460 (25%)]	Loss: 0.035	%: 99.33
+Train Epoch: 22 [18000/29460 (50%)]	Loss: 0.031	%: 99.00
+Train Epoch: 22 [27000/29460 (75%)]	Loss: 0.028	%: 99.00
+====> Epoch: 22 Avg loss: 0.0334 -- Accu 98.72
+====> TEST Epoch: 22 Avg loss: 0.1301 -- Avg Accu 97.35
+Train Epoch: 23 [0/29460 (0%)]	Loss: 0.027	%: 99.00
+Train Epoch: 23 [9000/29460 (25%)]	Loss: 0.024	%: 98.67
+Train Epoch: 23 [18000/29460 (50%)]	Loss: 0.053	%: 98.67
+Train Epoch: 23 [27000/29460 (75%)]	Loss: 0.023	%: 98.67
+====> Epoch: 23 Avg loss: 0.0284 -- Accu 98.92
+====> TEST Epoch: 23 Avg loss: 0.1305 -- Avg Accu 97.55
+Train Epoch: 24 [0/29460 (0%)]	Loss: 0.010	%: 99.67
+Train Epoch: 24 [9000/29460 (25%)]	Loss: 0.050	%: 98.67
+Train Epoch: 24 [18000/29460 (50%)]	Loss: 0.015	%: 99.33
+Train Epoch: 24 [27000/29460 (75%)]	Loss: 0.010	%: 99.67
+====> Epoch: 24 Avg loss: 0.0262 -- Accu 99.09
+====> TEST Epoch: 24 Avg loss: 0.1173 -- Avg Accu 97.40
+Train Epoch: 25 [0/29460 (0%)]	Loss: 0.005	%: 100.00
+Train Epoch: 25 [9000/29460 (25%)]	Loss: 0.028	%: 98.67
+Train Epoch: 25 [18000/29460 (50%)]	Loss: 0.043	%: 98.33
+Train Epoch: 25 [27000/29460 (75%)]	Loss: 0.017	%: 99.33
+====> Epoch: 25 Avg loss: 0.0258 -- Accu 99.05
+====> TEST Epoch: 25 Avg loss: 0.1413 -- Avg Accu 97.10
+Train Epoch: 26 [0/29460 (0%)]	Loss: 0.021	%: 98.67
+Train Epoch: 26 [9000/29460 (25%)]	Loss: 0.015	%: 99.33
+Train Epoch: 26 [18000/29460 (50%)]	Loss: 0.027	%: 99.33
+Train Epoch: 26 [27000/29460 (75%)]	Loss: 0.014	%: 99.67
+====> Epoch: 26 Avg loss: 0.0254 -- Accu 99.04
+====> TEST Epoch: 26 Avg loss: 0.0976 -- Avg Accu 97.60
+Train Epoch: 27 [0/29460 (0%)]	Loss: 0.002	%: 100.00
+Train Epoch: 27 [9000/29460 (25%)]	Loss: 0.011	%: 99.67
+Train Epoch: 27 [18000/29460 (50%)]	Loss: 0.027	%: 99.33
+Train Epoch: 27 [27000/29460 (75%)]	Loss: 0.006	%: 99.67
+====> Epoch: 27 Avg loss: 0.0260 -- Accu 99.09
+====> TEST Epoch: 27 Avg loss: 0.1245 -- Avg Accu 97.40
+Train Epoch: 28 [0/29460 (0%)]	Loss: 0.019	%: 99.67
+Train Epoch: 28 [9000/29460 (25%)]	Loss: 0.019	%: 99.33
+Train Epoch: 28 [18000/29460 (50%)]	Loss: 0.007	%: 100.00
+Train Epoch: 28 [27000/29460 (75%)]	Loss: 0.029	%: 99.00
+====> Epoch: 28 Avg loss: 0.0239 -- Accu 99.15
+====> TEST Epoch: 28 Avg loss: 0.1725 -- Avg Accu 97.65
+Train Epoch: 29 [0/29460 (0%)]	Loss: 0.042	%: 98.00
+Train Epoch: 29 [9000/29460 (25%)]	Loss: 0.029	%: 99.00
+Train Epoch: 29 [18000/29460 (50%)]	Loss: 0.069	%: 98.67
+Train Epoch: 29 [27000/29460 (75%)]	Loss: 0.007	%: 99.67
+====> Epoch: 29 Avg loss: 0.0253 -- Accu 99.08
+====> TEST Epoch: 29 Avg loss: 0.0988 -- Avg Accu 97.40
+Train Epoch: 30 [0/29460 (0%)]	Loss: 0.013	%: 99.33
+Train Epoch: 30 [9000/29460 (25%)]	Loss: 0.018	%: 99.67
+Train Epoch: 30 [18000/29460 (50%)]	Loss: 0.031	%: 99.67
+Train Epoch: 30 [27000/29460 (75%)]	Loss: 0.031	%: 99.00
+====> Epoch: 30 Avg loss: 0.0286 -- Accu 98.93
+====> TEST Epoch: 30 Avg loss: 0.1288 -- Avg Accu 97.35
+Train Epoch: 31 [0/29460 (0%)]	Loss: 0.018	%: 99.00
+Train Epoch: 31 [9000/29460 (25%)]	Loss: 0.012	%: 99.67
+Train Epoch: 31 [18000/29460 (50%)]	Loss: 0.041	%: 98.33
+Train Epoch: 31 [27000/29460 (75%)]	Loss: 0.042	%: 99.00
+====> Epoch: 31 Avg loss: 0.0278 -- Accu 98.91
+====> TEST Epoch: 31 Avg loss: 0.1143 -- Avg Accu 97.50
+Train Epoch: 32 [0/29460 (0%)]	Loss: 0.049	%: 97.33
+Train Epoch: 32 [9000/29460 (25%)]	Loss: 0.009	%: 99.33
+Train Epoch: 32 [18000/29460 (50%)]	Loss: 0.009	%: 99.67
+Train Epoch: 32 [27000/29460 (75%)]	Loss: 0.012	%: 99.33
+====> Epoch: 32 Avg loss: 0.0288 -- Accu 98.98
+====> TEST Epoch: 32 Avg loss: 0.1323 -- Avg Accu 97.25
+Train Epoch: 33 [0/29460 (0%)]	Loss: 0.054	%: 99.00
+Train Epoch: 33 [9000/29460 (25%)]	Loss: 0.006	%: 100.00
+Train Epoch: 33 [18000/29460 (50%)]	Loss: 0.037	%: 99.00
+Train Epoch: 33 [27000/29460 (75%)]	Loss: 0.061	%: 96.67
+====> Epoch: 33 Avg loss: 0.0241 -- Accu 99.10
+====> TEST Epoch: 33 Avg loss: 0.0965 -- Avg Accu 96.95
+Train Epoch: 34 [0/29460 (0%)]	Loss: 0.014	%: 99.33
+Train Epoch: 34 [9000/29460 (25%)]	Loss: 0.002	%: 100.00
+Train Epoch: 34 [18000/29460 (50%)]	Loss: 0.027	%: 99.33
+Train Epoch: 34 [27000/29460 (75%)]	Loss: 0.020	%: 99.33
+====> Epoch: 34 Avg loss: 0.0280 -- Accu 98.93
+====> TEST Epoch: 34 Avg loss: 0.1436 -- Avg Accu 97.60
+Train Epoch: 35 [0/29460 (0%)]	Loss: 0.006	%: 100.00
+Train Epoch: 35 [9000/29460 (25%)]	Loss: 0.021	%: 99.33
+Train Epoch: 35 [18000/29460 (50%)]	Loss: 0.013	%: 99.33
+Train Epoch: 35 [27000/29460 (75%)]	Loss: 0.012	%: 99.67
+====> Epoch: 35 Avg loss: 0.0264 -- Accu 99.03
+====> TEST Epoch: 35 Avg loss: 0.0924 -- Avg Accu 97.50
+Train Epoch: 36 [0/29460 (0%)]	Loss: 0.022	%: 98.67
+Train Epoch: 36 [9000/29460 (25%)]	Loss: 0.025	%: 99.00
+Train Epoch: 36 [18000/29460 (50%)]	Loss: 0.034	%: 98.00
+Train Epoch: 36 [27000/29460 (75%)]	Loss: 0.025	%: 99.33
+====> Epoch: 36 Avg loss: 0.0240 -- Accu 99.12
+====> TEST Epoch: 36 Avg loss: 0.1989 -- Avg Accu 96.50
+Train Epoch: 37 [0/29460 (0%)]	Loss: 0.034	%: 98.67
+Train Epoch: 37 [9000/29460 (25%)]	Loss: 0.031	%: 99.33
+Train Epoch: 37 [18000/29460 (50%)]	Loss: 0.024	%: 98.67
+Train Epoch: 37 [27000/29460 (75%)]	Loss: 0.017	%: 99.33
+====> Epoch: 37 Avg loss: 0.0294 -- Accu 98.94
+====> TEST Epoch: 37 Avg loss: 0.1380 -- Avg Accu 96.80
+Train Epoch: 38 [0/29460 (0%)]	Loss: 0.041	%: 98.67
+Train Epoch: 38 [9000/29460 (25%)]	Loss: 0.014	%: 99.33
+Train Epoch: 38 [18000/29460 (50%)]	Loss: 0.012	%: 99.67
+Train Epoch: 38 [27000/29460 (75%)]	Loss: 0.004	%: 100.00
+====> Epoch: 38 Avg loss: 0.0302 -- Accu 98.93
+====> TEST Epoch: 38 Avg loss: 0.1729 -- Avg Accu 96.65
+Train Epoch: 39 [0/29460 (0%)]	Loss: 0.045	%: 99.00
+Train Epoch: 39 [9000/29460 (25%)]	Loss: 0.037	%: 99.00
+Train Epoch: 39 [18000/29460 (50%)]	Loss: 0.006	%: 100.00
+Train Epoch: 39 [27000/29460 (75%)]	Loss: 0.020	%: 98.67
+====> Epoch: 39 Avg loss: 0.0324 -- Accu 98.85
+====> TEST Epoch: 39 Avg loss: 0.1107 -- Avg Accu 97.40
+Train Epoch: 40 [0/29460 (0%)]	Loss: 0.011	%: 99.33
+Train Epoch: 40 [9000/29460 (25%)]	Loss: 0.034	%: 98.67
+Train Epoch: 40 [18000/29460 (50%)]	Loss: 0.035	%: 99.33
+Train Epoch: 40 [27000/29460 (75%)]	Loss: 0.012	%: 99.00
+====> Epoch: 40 Avg loss: 0.0309 -- Accu 98.88
+====> TEST Epoch: 40 Avg loss: 0.1341 -- Avg Accu 97.30
+Train Epoch: 41 [0/29460 (0%)]	Loss: 0.031	%: 99.33
+Train Epoch: 41 [9000/29460 (25%)]	Loss: 0.043	%: 97.67
+Train Epoch: 41 [18000/29460 (50%)]	Loss: 0.013	%: 99.33
+Train Epoch: 41 [27000/29460 (75%)]	Loss: 0.033	%: 99.00
+====> Epoch: 41 Avg loss: 0.0222 -- Accu 99.18
+====> TEST Epoch: 41 Avg loss: 0.1184 -- Avg Accu 97.55
+Train Epoch: 42 [0/29460 (0%)]	Loss: 0.010	%: 99.67
+Train Epoch: 42 [9000/29460 (25%)]	Loss: 0.042	%: 98.00
+Train Epoch: 42 [18000/29460 (50%)]	Loss: 0.001	%: 100.00
+Train Epoch: 42 [27000/29460 (75%)]	Loss: 0.015	%: 99.33
+====> Epoch: 42 Avg loss: 0.0200 -- Accu 99.26
+====> TEST Epoch: 42 Avg loss: 0.2107 -- Avg Accu 97.10
+Train Epoch: 43 [0/29460 (0%)]	Loss: 0.010	%: 100.00
+Train Epoch: 43 [9000/29460 (25%)]	Loss: 0.022	%: 99.67
+Train Epoch: 43 [18000/29460 (50%)]	Loss: 0.009	%: 99.67
+Train Epoch: 43 [27000/29460 (75%)]	Loss: 0.016	%: 99.67
+====> Epoch: 43 Avg loss: 0.0172 -- Accu 99.40
+====> TEST Epoch: 43 Avg loss: 0.1621 -- Avg Accu 97.10
+Train Epoch: 44 [0/29460 (0%)]	Loss: 0.003	%: 100.00
+Train Epoch: 44 [9000/29460 (25%)]	Loss: 0.021	%: 99.67
+Train Epoch: 44 [18000/29460 (50%)]	Loss: 0.017	%: 99.33
+Train Epoch: 44 [27000/29460 (75%)]	Loss: 0.052	%: 98.67
+====> Epoch: 44 Avg loss: 0.0150 -- Accu 99.47
+====> TEST Epoch: 44 Avg loss: 0.0864 -- Avg Accu 98.15
+Train Epoch: 45 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 45 [9000/29460 (25%)]	Loss: 0.020	%: 98.67
+Train Epoch: 45 [18000/29460 (50%)]	Loss: 0.053	%: 98.33
+Train Epoch: 45 [27000/29460 (75%)]	Loss: 0.001	%: 100.00
+====> Epoch: 45 Avg loss: 0.0152 -- Accu 99.47
+====> TEST Epoch: 45 Avg loss: 0.1338 -- Avg Accu 97.00
+Train Epoch: 46 [0/29460 (0%)]	Loss: 0.010	%: 99.33
+Train Epoch: 46 [9000/29460 (25%)]	Loss: 0.036	%: 98.00
+Train Epoch: 46 [18000/29460 (50%)]	Loss: 0.003	%: 100.00
+Train Epoch: 46 [27000/29460 (75%)]	Loss: 0.016	%: 99.33
+====> Epoch: 46 Avg loss: 0.0170 -- Accu 99.34
+====> TEST Epoch: 46 Avg loss: 0.0928 -- Avg Accu 97.75
+Train Epoch: 47 [0/29460 (0%)]	Loss: 0.062	%: 99.00
+Train Epoch: 47 [9000/29460 (25%)]	Loss: 0.005	%: 100.00
+Train Epoch: 47 [18000/29460 (50%)]	Loss: 0.011	%: 99.67
+Train Epoch: 47 [27000/29460 (75%)]	Loss: 0.021	%: 99.33
+====> Epoch: 47 Avg loss: 0.0136 -- Accu 99.53
+====> TEST Epoch: 47 Avg loss: 0.1209 -- Avg Accu 97.55
+Train Epoch: 48 [0/29460 (0%)]	Loss: 0.002	%: 100.00
+Train Epoch: 48 [9000/29460 (25%)]	Loss: 0.007	%: 99.67
+Train Epoch: 48 [18000/29460 (50%)]	Loss: 0.002	%: 100.00
+Train Epoch: 48 [27000/29460 (75%)]	Loss: 0.023	%: 99.33
+====> Epoch: 48 Avg loss: 0.0145 -- Accu 99.44
+====> TEST Epoch: 48 Avg loss: 0.1335 -- Avg Accu 97.25
+Train Epoch: 49 [0/29460 (0%)]	Loss: 0.002	%: 100.00
+Train Epoch: 49 [9000/29460 (25%)]	Loss: 0.004	%: 100.00
+Train Epoch: 49 [18000/29460 (50%)]	Loss: 0.005	%: 100.00
+Train Epoch: 49 [27000/29460 (75%)]	Loss: 0.009	%: 99.67
+====> Epoch: 49 Avg loss: 0.0111 -- Accu 99.56
+====> TEST Epoch: 49 Avg loss: 0.1539 -- Avg Accu 97.80
+Train Epoch: 50 [0/29460 (0%)]	Loss: 0.000	%: 100.00
+Train Epoch: 50 [9000/29460 (25%)]	Loss: 0.018	%: 98.67
+Train Epoch: 50 [18000/29460 (50%)]	Loss: 0.012	%: 99.33
+Train Epoch: 50 [27000/29460 (75%)]	Loss: 0.010	%: 99.67
+====> Epoch: 50 Avg loss: 0.0124 -- Accu 99.57
+====> TEST Epoch: 50 Avg loss: 0.1478 -- Avg Accu 97.20
+Train Epoch: 51 [0/29460 (0%)]	Loss: 0.002	%: 100.00
+Train Epoch: 51 [9000/29460 (25%)]	Loss: 0.032	%: 97.67
+Train Epoch: 51 [18000/29460 (50%)]	Loss: 0.013	%: 99.00
+Train Epoch: 51 [27000/29460 (75%)]	Loss: 0.016	%: 99.67
+====> Epoch: 51 Avg loss: 0.0153 -- Accu 99.36
+====> TEST Epoch: 51 Avg loss: 0.1578 -- Avg Accu 97.50
+Train Epoch: 52 [0/29460 (0%)]	Loss: 0.022	%: 99.00
+Train Epoch: 52 [9000/29460 (25%)]	Loss: 0.012	%: 99.67
+Train Epoch: 52 [18000/29460 (50%)]	Loss: 0.007	%: 99.67
+Train Epoch: 52 [27000/29460 (75%)]	Loss: 0.006	%: 99.67
+====> Epoch: 52 Avg loss: 0.0143 -- Accu 99.47
+====> TEST Epoch: 52 Avg loss: 0.1843 -- Avg Accu 97.30
+Train Epoch: 53 [0/29460 (0%)]	Loss: 0.018	%: 99.00
+Train Epoch: 53 [9000/29460 (25%)]	Loss: 0.014	%: 99.33
+Train Epoch: 53 [18000/29460 (50%)]	Loss: 0.001	%: 100.00
+Train Epoch: 53 [27000/29460 (75%)]	Loss: 0.059	%: 99.00
+====> Epoch: 53 Avg loss: 0.0140 -- Accu 99.45
+====> TEST Epoch: 53 Avg loss: 0.1324 -- Avg Accu 96.95
+Train Epoch: 54 [0/29460 (0%)]	Loss: 0.009	%: 99.67
+Train Epoch: 54 [9000/29460 (25%)]	Loss: 0.007	%: 100.00
+Train Epoch: 54 [18000/29460 (50%)]	Loss: 0.008	%: 99.67
+Train Epoch: 54 [27000/29460 (75%)]	Loss: 0.005	%: 100.00
+====> Epoch: 54 Avg loss: 0.0144 -- Accu 99.47
+====> TEST Epoch: 54 Avg loss: 0.1964 -- Avg Accu 97.25
+Train Epoch: 55 [0/29460 (0%)]	Loss: 0.005	%: 99.67
+Train Epoch: 55 [9000/29460 (25%)]	Loss: 0.002	%: 100.00
+Train Epoch: 55 [18000/29460 (50%)]	Loss: 0.014	%: 99.67
+Train Epoch: 55 [27000/29460 (75%)]	Loss: 0.008	%: 99.67
+====> Epoch: 55 Avg loss: 0.0123 -- Accu 99.52
+====> TEST Epoch: 55 Avg loss: 0.1877 -- Avg Accu 97.25
+Train Epoch: 56 [0/29460 (0%)]	Loss: 0.018	%: 99.67
+Train Epoch: 56 [9000/29460 (25%)]	Loss: 0.009	%: 99.33
+Train Epoch: 56 [18000/29460 (50%)]	Loss: 0.001	%: 100.00
+Train Epoch: 56 [27000/29460 (75%)]	Loss: 0.009	%: 99.67
+====> Epoch: 56 Avg loss: 0.0145 -- Accu 99.44
+====> TEST Epoch: 56 Avg loss: 0.1051 -- Avg Accu 97.75
+Train Epoch: 57 [0/29460 (0%)]	Loss: 0.004	%: 100.00
+Train Epoch: 57 [9000/29460 (25%)]	Loss: 0.002	%: 100.00
+Train Epoch: 57 [18000/29460 (50%)]	Loss: 0.032	%: 98.67
+Train Epoch: 57 [27000/29460 (75%)]	Loss: 0.009	%: 99.67
+====> Epoch: 57 Avg loss: 0.0149 -- Accu 99.42
+====> TEST Epoch: 57 Avg loss: 0.2011 -- Avg Accu 96.90
+Train Epoch: 58 [0/29460 (0%)]	Loss: 0.017	%: 99.00
+Train Epoch: 58 [9000/29460 (25%)]	Loss: 0.004	%: 100.00
+Train Epoch: 58 [18000/29460 (50%)]	Loss: 0.019	%: 99.33
+Train Epoch: 58 [27000/29460 (75%)]	Loss: 0.039	%: 98.33
+====> Epoch: 58 Avg loss: 0.0190 -- Accu 99.30
+====> TEST Epoch: 58 Avg loss: 0.1402 -- Avg Accu 97.35
+Train Epoch: 59 [0/29460 (0%)]	Loss: 0.004	%: 100.00
+Train Epoch: 59 [9000/29460 (25%)]	Loss: 0.011	%: 99.67
+Train Epoch: 59 [18000/29460 (50%)]	Loss: 0.003	%: 100.00
+Train Epoch: 59 [27000/29460 (75%)]	Loss: 0.031	%: 98.33
+====> Epoch: 59 Avg loss: 0.0160 -- Accu 99.42
+====> TEST Epoch: 59 Avg loss: 0.1824 -- Avg Accu 97.00
+Train Epoch: 60 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 60 [9000/29460 (25%)]	Loss: 0.008	%: 99.67
+Train Epoch: 60 [18000/29460 (50%)]	Loss: 0.007	%: 99.67
+Train Epoch: 60 [27000/29460 (75%)]	Loss: 0.014	%: 99.67
+====> Epoch: 60 Avg loss: 0.0166 -- Accu 99.42
+====> TEST Epoch: 60 Avg loss: 0.1337 -- Avg Accu 97.30
+Train Epoch: 61 [0/29460 (0%)]	Loss: 0.019	%: 99.33
+Train Epoch: 61 [9000/29460 (25%)]	Loss: 0.030	%: 99.00
+Train Epoch: 61 [18000/29460 (50%)]	Loss: 0.008	%: 99.67
+Train Epoch: 61 [27000/29460 (75%)]	Loss: 0.005	%: 100.00
+====> Epoch: 61 Avg loss: 0.0166 -- Accu 99.40
+====> TEST Epoch: 61 Avg loss: 0.1576 -- Avg Accu 97.05
+Train Epoch: 62 [0/29460 (0%)]	Loss: 0.007	%: 99.67
+Train Epoch: 62 [9000/29460 (25%)]	Loss: 0.001	%: 100.00
+Train Epoch: 62 [18000/29460 (50%)]	Loss: 0.003	%: 100.00
+Train Epoch: 62 [27000/29460 (75%)]	Loss: 0.010	%: 99.33
+====> Epoch: 62 Avg loss: 0.0120 -- Accu 99.53
+====> TEST Epoch: 62 Avg loss: 0.1796 -- Avg Accu 96.75
+Train Epoch: 63 [0/29460 (0%)]	Loss: 0.005	%: 99.67
+Train Epoch: 63 [9000/29460 (25%)]	Loss: 0.004	%: 100.00
+Train Epoch: 63 [18000/29460 (50%)]	Loss: 0.001	%: 100.00
+Train Epoch: 63 [27000/29460 (75%)]	Loss: 0.026	%: 99.33
+====> Epoch: 63 Avg loss: 0.0108 -- Accu 99.59
+====> TEST Epoch: 63 Avg loss: 0.1991 -- Avg Accu 97.40
+Train Epoch: 64 [0/29460 (0%)]	Loss: 0.014	%: 99.33
+Train Epoch: 64 [9000/29460 (25%)]	Loss: 0.001	%: 100.00
+Train Epoch: 64 [18000/29460 (50%)]	Loss: 0.002	%: 100.00
+Train Epoch: 64 [27000/29460 (75%)]	Loss: 0.011	%: 99.67
+====> Epoch: 64 Avg loss: 0.0098 -- Accu 99.63
+====> TEST Epoch: 64 Avg loss: 0.1535 -- Avg Accu 97.35
+Train Epoch: 65 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 65 [9000/29460 (25%)]	Loss: 0.000	%: 100.00
+Train Epoch: 65 [18000/29460 (50%)]	Loss: 0.001	%: 100.00
+Train Epoch: 65 [27000/29460 (75%)]	Loss: 0.038	%: 99.00
+====> Epoch: 65 Avg loss: 0.0105 -- Accu 99.66
+====> TEST Epoch: 65 Avg loss: 0.1111 -- Avg Accu 97.95
+Train Epoch: 66 [0/29460 (0%)]	Loss: 0.027	%: 98.33
+Train Epoch: 66 [9000/29460 (25%)]	Loss: 0.007	%: 99.67
+Train Epoch: 66 [18000/29460 (50%)]	Loss: 0.004	%: 100.00
+Train Epoch: 66 [27000/29460 (75%)]	Loss: 0.004	%: 100.00
+====> Epoch: 66 Avg loss: 0.0109 -- Accu 99.65
+====> TEST Epoch: 66 Avg loss: 0.1820 -- Avg Accu 97.40
+Train Epoch: 67 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 67 [9000/29460 (25%)]	Loss: 0.003	%: 100.00
+Train Epoch: 67 [18000/29460 (50%)]	Loss: 0.000	%: 100.00
+Train Epoch: 67 [27000/29460 (75%)]	Loss: 0.017	%: 99.67
+====> Epoch: 67 Avg loss: 0.0092 -- Accu 99.66
+====> TEST Epoch: 67 Avg loss: 0.1857 -- Avg Accu 97.90
+Train Epoch: 68 [0/29460 (0%)]	Loss: 0.044	%: 98.67
+Train Epoch: 68 [9000/29460 (25%)]	Loss: 0.002	%: 100.00
+Train Epoch: 68 [18000/29460 (50%)]	Loss: 0.003	%: 100.00
+Train Epoch: 68 [27000/29460 (75%)]	Loss: 0.014	%: 99.00
+====> Epoch: 68 Avg loss: 0.0101 -- Accu 99.62
+====> TEST Epoch: 68 Avg loss: 0.1260 -- Avg Accu 97.65
+Train Epoch: 69 [0/29460 (0%)]	Loss: 0.008	%: 99.33
+Train Epoch: 69 [9000/29460 (25%)]	Loss: 0.007	%: 100.00
+Train Epoch: 69 [18000/29460 (50%)]	Loss: 0.010	%: 99.67
+Train Epoch: 69 [27000/29460 (75%)]	Loss: 0.009	%: 99.67
+====> Epoch: 69 Avg loss: 0.0093 -- Accu 99.65
+====> TEST Epoch: 69 Avg loss: 0.1082 -- Avg Accu 97.70
+Train Epoch: 70 [0/29460 (0%)]	Loss: 0.021	%: 99.33
+Train Epoch: 70 [9000/29460 (25%)]	Loss: 0.017	%: 99.33
+Train Epoch: 70 [18000/29460 (50%)]	Loss: 0.006	%: 99.67
+Train Epoch: 70 [27000/29460 (75%)]	Loss: 0.016	%: 99.33
+====> Epoch: 70 Avg loss: 0.0095 -- Accu 99.65
+====> TEST Epoch: 70 Avg loss: 0.1635 -- Avg Accu 97.55
+Train Epoch: 71 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 71 [9000/29460 (25%)]	Loss: 0.038	%: 98.67
+Train Epoch: 71 [18000/29460 (50%)]	Loss: 0.009	%: 99.67
+Train Epoch: 71 [27000/29460 (75%)]	Loss: 0.035	%: 97.67
+====> Epoch: 71 Avg loss: 0.0086 -- Accu 99.68
+====> TEST Epoch: 71 Avg loss: 0.1836 -- Avg Accu 97.15
+Train Epoch: 72 [0/29460 (0%)]	Loss: 0.006	%: 100.00
+Train Epoch: 72 [9000/29460 (25%)]	Loss: 0.016	%: 99.67
+Train Epoch: 72 [18000/29460 (50%)]	Loss: 0.004	%: 100.00
+Train Epoch: 72 [27000/29460 (75%)]	Loss: 0.001	%: 100.00
+====> Epoch: 72 Avg loss: 0.0113 -- Accu 99.61
+====> TEST Epoch: 72 Avg loss: 0.1561 -- Avg Accu 97.75
+Train Epoch: 73 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 73 [9000/29460 (25%)]	Loss: 0.027	%: 98.67
+Train Epoch: 73 [18000/29460 (50%)]	Loss: 0.017	%: 99.33
+Train Epoch: 73 [27000/29460 (75%)]	Loss: 0.000	%: 100.00
+====> Epoch: 73 Avg loss: 0.0102 -- Accu 99.66
+====> TEST Epoch: 73 Avg loss: 0.1373 -- Avg Accu 98.20
+Train Epoch: 74 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 74 [9000/29460 (25%)]	Loss: 0.002	%: 100.00
+Train Epoch: 74 [18000/29460 (50%)]	Loss: 0.006	%: 100.00
+Train Epoch: 74 [27000/29460 (75%)]	Loss: 0.000	%: 100.00
+====> Epoch: 74 Avg loss: 0.0077 -- Accu 99.74
+====> TEST Epoch: 74 Avg loss: 0.1268 -- Avg Accu 97.70
+Train Epoch: 75 [0/29460 (0%)]	Loss: 0.011	%: 99.67
+Train Epoch: 75 [9000/29460 (25%)]	Loss: 0.015	%: 99.67
+Train Epoch: 75 [18000/29460 (50%)]	Loss: 0.042	%: 98.00
+Train Epoch: 75 [27000/29460 (75%)]	Loss: 0.039	%: 98.00
+====> Epoch: 75 Avg loss: 0.0093 -- Accu 99.64
+====> TEST Epoch: 75 Avg loss: 0.2215 -- Avg Accu 97.00
+Train Epoch: 76 [0/29460 (0%)]	Loss: 0.000	%: 100.00
+Train Epoch: 76 [9000/29460 (25%)]	Loss: 0.004	%: 100.00
+Train Epoch: 76 [18000/29460 (50%)]	Loss: 0.005	%: 99.67
+Train Epoch: 76 [27000/29460 (75%)]	Loss: 0.009	%: 99.67
+====> Epoch: 76 Avg loss: 0.0084 -- Accu 99.69
+====> TEST Epoch: 76 Avg loss: 0.2014 -- Avg Accu 97.45
+Train Epoch: 77 [0/29460 (0%)]	Loss: 0.000	%: 100.00
+Train Epoch: 77 [9000/29460 (25%)]	Loss: 0.001	%: 100.00
+Train Epoch: 77 [18000/29460 (50%)]	Loss: 0.001	%: 100.00
+Train Epoch: 77 [27000/29460 (75%)]	Loss: 0.010	%: 99.33
+====> Epoch: 77 Avg loss: 0.0086 -- Accu 99.70
+====> TEST Epoch: 77 Avg loss: 0.1145 -- Avg Accu 97.70
+Train Epoch: 78 [0/29460 (0%)]	Loss: 0.000	%: 100.00
+Train Epoch: 78 [9000/29460 (25%)]	Loss: 0.048	%: 96.67
+Train Epoch: 78 [18000/29460 (50%)]	Loss: 0.016	%: 99.33
+Train Epoch: 78 [27000/29460 (75%)]	Loss: 0.010	%: 99.67
+====> Epoch: 78 Avg loss: 0.0093 -- Accu 99.67
+====> TEST Epoch: 78 Avg loss: 0.0928 -- Avg Accu 98.20
+Train Epoch: 79 [0/29460 (0%)]	Loss: 0.001	%: 100.00
+Train Epoch: 79 [9000/29460 (25%)]	Loss: 0.008	%: 99.33
+Train Epoch: 79 [18000/29460 (50%)]	Loss: 0.035	%: 99.00
+Train Epoch: 79 [27000/29460 (75%)]	Loss: 0.001	%: 100.00
+====> Epoch: 79 Avg loss: 0.0081 -- Accu 99.72
+====> TEST Epoch: 79 Avg loss: 0.1479 -- Avg Accu 97.05
+Train Epoch: 80 [0/29460 (0%)]	Loss: 0.003	%: 100.00
+Train Epoch: 80 [9000/29460 (25%)]	Loss: 0.004	%: 100.00
+Train Epoch: 80 [18000/29460 (50%)]	Loss: 0.008	%: 100.00
+Train Epoch: 80 [27000/29460 (75%)]	Loss: 0.000	%: 100.00
+====> Epoch: 80 Avg loss: 0.0074 -- Accu 99.75
+====> TEST Epoch: 80 Avg loss: 0.1184 -- Avg Accu 97.80
