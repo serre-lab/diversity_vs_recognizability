@@ -1,5 +1,5 @@
 import torch.utils.data as data_utils
-from .custom_loader import OmniglotDataset, OmniglotSetsDatasetNS#, OmniglotGeneral, OmniglotWeakFast
+from .custom_loader import OmniglotDataset, OmniglotSetsDatasetNS, NShotTaskSampler#, OmniglotGeneral, OmniglotWeakFast
 from .custom_transform import Binarize, Invert, Scale_0_1, Dilate, ScaleCenter
 import torchvision.transforms as tforms
 from torchvision.datasets import MNIST
