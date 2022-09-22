@@ -19,8 +19,10 @@ python3 1_train_vaestn.py --device cuda:0 --z_size 80 --time_step 100 --out_dir 
 ```
 Do not forget to change `--out_dir` and `--dataset_root` args to your saving path and data path (omniglot). If you want to reproduce all the VAE-STN models presented in Fig. 3a (light blue data points), you need to run this command line and vary `--beta` from 0 to 4 (step 0.25),   `--time_step` from 20 to 90 (step 10) and `--z_size` from 10 to 400 (step 25).
 
-Here is a gif of the one-shot generation made by the vae-stn
-<img src="trained_model/vae_stn/vae_stn_exemple/fig/anim_gene.gif" height="300" />
+Here is a gif of the one-shot generation made by the vae-stn:
+<p align="center">
+<img src="trained_model/vae_stn/vae_stn_exemple/fig/anim_gene.gif" height="200" width="400" />
+</p>
 
 ### VAE-NS (Neural Statistician [3])
 ```
@@ -93,6 +95,8 @@ Those 2 python files takes the file `config.json` as a parameter. This file desc
     "distance": "l2" ## the distance used in the feature space to compute the diversity
 }
 ```
+
+Each of these 2 command lines returns a file that containing a list of dictionary. In those dictionary the key "accuracy" and "creativity" correspond to the recognizability and the diveristy, respectively. 
 
 ### Reference
 [1] - Lake, Brenden M., Ruslan Salakhutdinov, and Joshua B. Tenenbaum. "Human-level concept learning through probabilistic program induction." Science 350.6266 (2015): 1332-1338.\
