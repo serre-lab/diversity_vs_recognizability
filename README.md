@@ -26,7 +26,7 @@ Before training any generative model, you need to download the [Omniglot dataset
 
 ### VAE-STN (VAE with spatial transformer [2])
 ```
-python3 1_train_vaestn.py --device cuda:0 --z_size 80 --time_step 100 --out_dir outdir --dataset_rout dataset_root --beta 1
+python3 1_train_vaestn.py --device cuda:0 --z_size 80 --time_step 100 --out_dir outdir --dataset_root dataset_root --beta 1
 ```
 Do not forget to change `--out_dir` and `--dataset_root` args to your saving path and data path (omniglot). If you want to reproduce all the VAE-STN models presented in Fig. 3a (light blue data points), you need to run this command line and vary `--beta` from 0 to 4 (step 0.25),   `--time_step` from 20 to 90 (step 10) and `--z_size` from 10 to 400 (step 25).
 
