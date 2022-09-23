@@ -4,7 +4,7 @@ Link to the article : https://arxiv.org/abs/2205.10370
 
 ## 1. Quick Summary
 
-<img align="right" src="image/Fig1.png" height="400">
+<img align="right" src="image/Fig1.png" height="250">
 In our Neurips2022 article entitled "Diversity vs. Recognizability: Human-like generalization in one-shot generative models", we introduce a new framework to assess one-shot generative model. The evaluation framework is based on 1) the diversity of the generated samples and 2) their recognizability.The higher the diversity and the recognizability the better the generalization ability of the generative model.
 <br/>
 <br/>
@@ -16,7 +16,7 @@ Our 3 main results :
 * The model that best approximates the human behavior is the VAE-NS that includes context integration.
 
 <p align="center">
-    <img src="image/Fig3.png" height="300"><img src="image/Fig4b.png" height="300"><img src="image/Fig5a.png" height="300">
+    <img src="image/Fig3.png" height="250"><img src="image/Fig4b.png" height="250"><img src="image/Fig5a.png" height="250">
 </p>
 
 
